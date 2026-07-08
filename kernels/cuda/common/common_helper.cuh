@@ -25,3 +25,4 @@ inline void cuda_check(cudaError_t err, const char* file, int line) {
 #define CUDA_CHECK(err) cuda_check(err, __FILE__, __LINE__)
 
 /// sum reduce
+__device__ __forceinline__
