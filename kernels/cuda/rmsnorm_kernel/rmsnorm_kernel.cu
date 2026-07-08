@@ -31,8 +31,8 @@ __global__ void rmsfwd_kernel(
         /// as it is used in attentions in transformers so we need to use batchid and all
     const long long base = (long long)batchid * numhead * headdim * seqlen + 
                                 (long long)headid * headdim * seqlen;
-        const __half* INptr  = input + base;
-        __half* outptr = output + base;
+    const __half* INptr  = input + base;
+    __half* outptr = output + base;
         /// now allocate the mem
     extern __shared__ char smen_raw[];
     char* ptr = smen_raw;
@@ -104,4 +104,25 @@ __global__ void rmsfwd_kernel(
     if (globalRow >= seqlen) continue;   /// last tile can be partial if seqlen % Br != 0
             FLOAT4(outptr[globalRow * headdim + c8 * 8]) = CFLOAT4(Asmem[row * rowStride + c8 * 8]);
         }
+}
+
+template<int Br , int seqlen , int headdim , int numhead>
+__global__ void rmsbwd_kernel(
+    const __half* __restrict__ dl_final,
+    const __half* __restrict__ input,
+          __half* __restrict__ dl_dx,
+          __half* __restrict__ dl_dy,
+          float eps
+)
+{
+    int tid    = threadIdx.x;
+    int lane   = tid & 31;
+    int warpid = tid >> 5; 
+    const int batchid = blockIdx.x;
+    const int headid  = blockIdx.y;
+    const int tileid  = blockIdx.z;
+        
+    const long long base = (long long)batchid * numhead * headdim * seqlen + 
+                                (long long)headid * headdim * seqlen;
+    const __half* INptr  = input + base;
 }
