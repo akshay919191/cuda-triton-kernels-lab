@@ -1,0 +1,45 @@
+# VS Code
+.vscode/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# PyTorch/CUDA extension build outputs
+build/
+dist/
+*.egg-info/
+*.so
+
+*.o
+*.out
+*.a
+
+# CUDA generated/intermediate files
+*.ptx
+*.cubin
+*.fatbin
+*.sass
+
+# Profiling reports
+profiles/
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Logs
+*.log
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# OS junk
+.DS_Store

@@ -15,11 +15,12 @@
 /*
 mean of the whole data , wrt to col --- row wise
 */
-template<int Br , int seqlen , int headdim , int numhead>
+template<int Br, int seqlen, int headdim, int numhead>
 __global__ void rmsfwd_kernel(
     const __half* __restrict__ input,
     __half* __restrict__ output,
-    float eps , const __half* __restrict__ gammaGlobal
+    float eps,
+    const __half* __restrict__ gammaGlobal
 )
 {
     int tid    = threadIdx.x;
@@ -89,7 +90,7 @@ __global__ void rmsfwd_kernel(
     __syncthreads();
         /// loaded the whole Br * headim 
         /// now we need that reduce but but but , we need x ** 2 mean not x ; x is the whole row
-    multiWarpReductionSUM_RMS(Asmem , result , headdim , Br);    //// it gives us sum not mean so divide by total numbers in a row means headdim
+    multiWarpReductionSUM_RMS(Asmem, result, headdim, rowStride, Br);    //// it gives us sum not mean so divide by total numbers in a row means headdim
 
     __syncthreads();
 
@@ -121,13 +122,13 @@ __global__ void rmsfwd_kernel(
         }
 }
 
-template<int Br , int seqlen , int headdim , int numhead>
+template<int Br, int seqlen, int headdim, int numhead>
 __global__ void rmsbwd_kernel(
     const __half* __restrict__ dl_final_out,
     const __half* __restrict__ input,
     const __half* __restrict__ gammaGlobal,
-          __half* __restrict__ dl_dx,
-          float eps
+    __half* __restrict__ dl_dx,
+    float eps
 )
 {
     int tid    = threadIdx.x;
@@ -139,6 +140,7 @@ __global__ void rmsbwd_kernel(
 
     extern __shared__ char smem[];
     char* ptr = smem;
+    const int rowStride = headdim + PADDING;
 
     /*
     we need space for DO , dl_final , input , result(for rms deno saving)
@@ -220,7 +222,7 @@ __global__ void rmsbwd_kernel(
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncthreads();
 
-    multiWarpReductionSUM_RMS(dl_in , result , headdim , Br);
+    multiWarpReductionSUM_RMS(dl_in, result, headdim, rowStride, Br);
     __syncthreads();
 
     for (int row = tid; row < Br; row += blockDim.x)
@@ -228,16 +230,37 @@ __global__ void rmsbwd_kernel(
 
     __syncthreads(); 
 
-    elementwisemultiply<Br , headdim , 1>(dl_final , gamma , dl_O);
+    // dl_O = dl_final * gamma
+    for (int i = tid; i < Br * headdim; i += blockDim.x)
+    {
+        int r = i / headdim;
+        int c = i % headdim;
+
+        int idx = r * rowStride + c;
+
+        dl_O[idx] = __float2half(
+            __half2float(dl_final[idx]) * __half2float(gamma[c])
+        );
+    }
     __syncthreads();
 
     /// now we need only dl/dx  
 
     //// now d_final hold the summation
-    elementwisemultiply<Br , headdim , 1>(dl_O , dl_in , dl_final);
+    for (int i = tid; i < Br * headdim; i += blockDim.x)
+    {
+        int r = i / headdim;
+        int c = i % headdim;
+
+        int idx = r * rowStride + c;
+
+        dl_final[idx] = __float2half(
+            __half2float(dl_O[idx]) * __half2float(dl_in[idx])
+        );
+    }
     __syncthreads();
 
-    multiWarpReductionSUM_RMS(dl_final , summat , headdim , Br);
+    multiWarpReductionSUM_plain_RMS(dl_final, summat, headdim, rowStride, Br);
     __syncthreads();
 
     for(int i = tid ; i < Br * headdim ; i += blockDim.x)
@@ -246,16 +269,30 @@ __global__ void rmsbwd_kernel(
         int c = i % headdim;
 
         float val = result[r];
-        dl_O[r * headdim + c]  = __float2half(__half2float(dl_O[r * headdim + c]) / val);
-        dl_in[r * headdim + c] = __float2half(__half2float(dl_in[r * headdim + c]) / (val * val * val));
+        int idx = r * rowStride + c;
+
+        dl_O[idx]  = __float2half(__half2float(dl_O[idx]) / val);
+        dl_in[idx] = __float2half(__half2float(dl_in[idx]) / (val * val * val));
     }
     __syncthreads();
 
 
-    for(int i = tid ; i < Br * headdim ; i += blockDim.x)
+    for (int i = tid; i < Br * headdim; i += blockDim.x)
     {
-        int r = i / headdim; int c = i % headdim;
-        out[r * headdim + c] = dl_O[r * headdim + c] - (dl_in[r * headdim + c] * summat[r]);
+        int r = i / headdim;
+        int c = i % headdim;
+
+        int globalRow = tileid * Br + r;
+        if (globalRow >= seqlen) continue;
+
+        int smem_idx = r * rowStride + c;
+
+        float a = __half2float(dl_O[smem_idx]);   // dy * gamma / rms
+        float b = __half2float(dl_in[smem_idx]);  // x / rms^3
+
+        float s = summat[r] / static_cast<float>(headdim);
+
+        out[globalRow * headdim + c] = __float2half(a - b * s);
     }
 }
 
