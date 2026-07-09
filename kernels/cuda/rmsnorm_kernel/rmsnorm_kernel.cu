@@ -128,6 +128,7 @@ __global__ void rmsbwd_kernel(
     const __half* __restrict__ input,
     const __half* __restrict__ gammaGlobal,
     __half* __restrict__ dl_dx,
+    float* __restrict__ dl_gamma,
     float eps
 )
 {
@@ -191,7 +192,8 @@ __global__ void rmsbwd_kernel(
     const __half* INptr  = input + base;
     const __half* Fptr   = dl_final_out + base;
           __half* out    = dl_dx + base;
-    
+          float* gmma_bk= base + dl_gamma;
+
 
     int vec_elems = headdim / 8;  // Number of full 8-element chunks
 
@@ -222,6 +224,7 @@ __global__ void rmsbwd_kernel(
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncthreads();
 
+
     multiWarpReductionSUM_RMS(dl_in, result, headdim, rowStride, Br);
     __syncthreads();
 
@@ -229,6 +232,25 @@ __global__ void rmsbwd_kernel(
         result[row] = sqrtf(result[row] / static_cast<float>(headdim) + eps);
 
     __syncthreads(); 
+
+    // dgamma[c] += dy[row, c] * x[row, c] / rms[row]
+    for (int i = tid; i < Br * headdim; i += blockDim.x)
+    {
+        int r = i / headdim;
+        int c = i % headdim;
+
+        int globalRow = tileid * Br + r;
+        if (globalRow >= seqlen) continue;
+
+        int smem_idx = r * rowStride + c;
+
+        float dy_val = __half2float(dl_final[smem_idx]);
+        float x_val  = __half2float(dl_in[smem_idx]);
+        float rms    = result[r];
+
+        atomicAdd(&dl_gamma[c], dy_val * x_val / rms);
+    }
+    __syncthreads();
 
     // dl_O = dl_final * gamma
     for (int i = tid; i < Br * headdim; i += blockDim.x)
@@ -434,6 +456,7 @@ std::vector<torch::Tensor> rmsnorm_backward_launch(
     const int B = x.size(0);
 
     auto dx = torch::empty_like(x);
+    auto dgamma = torch::zeros({D}, x.options().dtype(torch::kFloat32));
 
     dim3 grid(B, NUM_HEADS, (SEQLEN + Br - 1) / Br);
     dim3 block(256);
@@ -445,12 +468,13 @@ std::vector<torch::Tensor> rmsnorm_backward_launch(
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(gamma.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(dx.data_ptr<at::Half>()),
+        dgamma.data_ptr<float>(),
         static_cast<float>(eps)
     );
 
     CUDA_CHECK(cudaGetLastError());
 
-    return {dx};
+    return {dx, dgamma};
 }
 
 
