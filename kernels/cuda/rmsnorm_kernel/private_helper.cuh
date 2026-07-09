@@ -129,7 +129,8 @@ void multiWarpReductionSUM_RMS(
 template<int M , int N , int K> /// this handles broadcastings too  (M * N) * (K * N) where K == 1  or (M * N) * (K * N) N == 1
 __device__ __forceinline__ void elementwisemultiply(
     const __half* __restrict__ inputA,
-    const __half* __restrict__ inputB
+    const __half* __restrict__ inputB,
+    const __half* __restrict__ output 
 )
 {
     int tid  = threadIdx.x;
@@ -140,13 +141,13 @@ __device__ __forceinline__ void elementwisemultiply(
         int c = i % N;
 
         if (K == 1) {
-            inputA[r * N + c] = inputA[r * N + c] * inputB[c];
+            output[r * N + c] = inputA[r * N + c] * inputB[c];
         } else if(N == 1) {
-            inputB[r * N * c] = inputB[r * N + c] * inputA[c];
+            output[r * N * c] = inputB[r * N + c] * inputA[c];
         } else {
             /// means we are safe dims are equal but safely we will have a fallback using assert 
             assert((M == K) && "M does not equal K (K != 1, no broadcasting)");
-            inputA[r * N + c] = inputA[r * N + c] * inputB[r * N + c];
+            output[r * N + c] = inputA[r * N + c] * inputB[r * N + c];
         }
     }
 }

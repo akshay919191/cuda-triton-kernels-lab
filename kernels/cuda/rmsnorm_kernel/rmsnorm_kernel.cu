@@ -127,7 +127,6 @@ __global__ void rmsbwd_kernel(
     const __half* __restrict__ input,
     const __half* __restrict__ gammaGlobal,
           __half* __restrict__ dl_dx,
-          __half* __restrict__ dl_dy,
           float eps
 )
 {
@@ -137,10 +136,6 @@ __global__ void rmsbwd_kernel(
     const int batchid = blockIdx.x;
     const int headid  = blockIdx.y;
     const int tileid  = blockIdx.z;
-        
-    const long long base = (long long)batchid * numhead * headdim * seqlen + 
-                                (long long)headid * headdim * seqlen;
-    const __half* INptr  = input + base;
 
     extern __shared__ char smem[];
     char* ptr = smem;
@@ -186,10 +181,15 @@ __global__ void rmsbwd_kernel(
     float* result = reinterpret_cast<float*>(ptr);
     ptr += Br * sizeof(float);
 
+    float* summat = reinterpret_cast<float*>(ptr);
+    ptr += Br * sizeof(float);
+
     const long long base = (long long)batchid * numhead * headdim * seqlen + 
                                 (long long)headid * headdim * seqlen;
     const __half* INptr  = input + base;
     const __half* Fptr   = dl_final + base;
+    const __half* out    = dl_dx + base;
+    
 
     int vec_elems = headdim / 8;  // Number of full 8-element chunks
 
@@ -209,10 +209,52 @@ __global__ void rmsbwd_kernel(
     );
     asm volatile("cp.async.commit_group;\n");
 
+    cpasynccopyRMS<Br , seqlen , headdim>(
+        Fptr,
+        dl_final,
+        headdim + PADDING,
+        tileid
+    );
+    asm volatile("cp.async.commit_group;\n");
+
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncthreads();
 
     multiWarpReductionSUM_RMS(dl_in , result , headdim , Br);
     __syncthreads();
-    
+
+    for (int row = tid; row < Br; row += blockDim.x)
+        result[row] = sqrtf(result[row] / static_cast<float>(headdim) + eps);
+
+    __syncthreads(); 
+
+    elementwisemultiply<Br , headdim , 1>(dl_final , gamma , dl_O);
+    __syncthreads();
+
+    /// now we need only dl/dx  
+
+    //// now d_final hold the summation
+    elementwisemultiply<Br , headdim , 1>(dl_O , dl_in , dl_final);
+    __syncthreads();
+
+    multiWarpReductionSUM_RMS(dl_final , summat , headdim , Br);
+    __syncthreads();
+
+    for(int i = tid ; i < Br * headdim ; i += blockDim.x)
+    {
+        int r = i / headdim;
+        int c = i % headdim;
+
+        float val = result[r];
+        dl_O[r * headdim + c]  = __float2half(__half2float(dl_O[r * headdim + c]) / val);
+        dl_in[r * headdim + c] = __float2half(__half2float(dl_in[r * headdim + c]) / (val * val * val));
+    }
+    __syncthreads();
+
+
+    for(int i = tid ; i < Br * headdim ; i += blockDim.x)
+    {
+        int r = i / headdim; int c = i % headdim;
+        out[r * headdim + c] = dl_O[r * headdim + c] - (dl_in[r * headdim + c] * summat[r]);
+    }
 }
