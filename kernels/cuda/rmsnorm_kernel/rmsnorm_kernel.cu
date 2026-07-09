@@ -37,26 +37,34 @@ __global__ void rmsfwd_kernel(
     extern __shared__ char smen_raw[];
     char* ptr = smen_raw;
     const int rowStride = headdim + PADDING;   /// real row width padded, used for every Asmem index below
-        ptr = reinterpret_cast<char*>(
-            (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
-        );
-        /// for A
-        __half* Asmem = reinterpret_cast<__half*>(ptr);
-        ptr += Br * (headdim + PADDING) * sizeof(__half);
-        ptr = reinterpret_cast<char*>(
-            (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
-        );
-        /// for B    for gamma
-        __half* gamma = reinterpret_cast<__half*>(ptr);
-        ptr += (headdim + PADDING) * sizeof(__half);
-        ptr = reinterpret_cast<char*>(
-            (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
-        );
-        /// due to multi warp , we will store the mean here 
-        float* result = reinterpret_cast<float*>(ptr);
-        ptr += Br * sizeof(float);
+    ptr = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
+    );
+    /// for A
+
+    __half* Asmem = reinterpret_cast<__half*>(ptr);
+    ptr += Br * (headdim + PADDING) * sizeof(__half);
+
+    ptr = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
+    );
+
+    /// for B    for gamma
+    __half* gamma = reinterpret_cast<__half*>(ptr);
+    ptr += (headdim + PADDING) * sizeof(__half);
+
+    ptr = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
+    );
+
+    /// due to multi warp , we will store the mean here 
+    float* result = reinterpret_cast<float*>(ptr);
+
+    ptr += Br * sizeof(float);
+
     float* denoSmem = reinterpret_cast<float*>(ptr);   // [Br], one slot per row
-        ptr += Br * sizeof(float);
+
+    ptr += Br * sizeof(float);
         /// launch with number of rows actually needed so no loop
         /// const int rowitr = tileid;   use tile id instead of new var
     for (int i = tid; i < headdim / 8; i += blockDim.x)
@@ -65,22 +73,24 @@ __global__ void rmsfwd_kernel(
         }
     __syncthreads();
     cpasynccopyRMS<seqlen , headdim>(
-            INptr,
-            Asmem,
-            headdim + PADDING,
-            tileid
-        );
+        INptr,
+        Asmem,
+        headdim + PADDING,
+        tileid
+    );
     asm volatile("cp.async.commit_group;\n");
+
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncthreads();
         /// loaded the whole Br * headim 
         /// now we need that reduce but but but , we need x ** 2 mean not x ; x is the whole row
     multiWarpReductionSUM_RMS(Asmem , result , headdim , Br);    //// it gives us sum not mean so divide by total numbers in a row means headdim
+
     __syncthreads();
+
     for (int row = tid; row < Br; row += blockDim.x)
-    {
         denoSmem[row] = sqrtf(result[row] / static_cast<float>(headdim) + eps);
-    }
+
     __syncthreads(); 
         /// now each row mean is in result , can be accesed by index
     for (int i = tid; i < Br * headdim; i += blockDim.x)
@@ -110,6 +120,7 @@ template<int Br , int seqlen , int headdim , int numhead>
 __global__ void rmsbwd_kernel(
     const __half* __restrict__ dl_final,
     const __half* __restrict__ input,
+    const __half* __restrict__ gammaGlobal,
           __half* __restrict__ dl_dx,
           __half* __restrict__ dl_dy,
           float eps
@@ -125,4 +136,53 @@ __global__ void rmsbwd_kernel(
     const long long base = (long long)batchid * numhead * headdim * seqlen + 
                                 (long long)headid * headdim * seqlen;
     const __half* INptr  = input + base;
+
+    extern __shared__ char smem[];
+    char* ptr = smem;
+
+    /*
+    we need space for DO , dl_final , input , result(for rms deno saving)
+    */
+
+    ptr = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31
+    );
+
+    __half* dl_in = reinterpret_cast<__half*>(ptr);
+    ptr += Br * (headdim + PADDING);
+
+    ptr = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31
+    );
+    
+    __half* dl_final = reinterpret_cast<__half*>(ptr);
+    ptr += Br * (headdim + PADDING);
+
+    ptr = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31
+    );
+    
+    __half* dl_O = reinterpret_cast<__half*>(ptr);
+    ptr += Br * (headdim + PADDING);
+
+    //// we need atleast 2-3 element wise multiplication so we will write it down in our helper header
+    ptr = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
+    );
+    /// for B    for gamma
+    __half* gamma = reinterpret_cast<__half*>(ptr);
+
+    ptr += (headdim + PADDING) * sizeof(__half);
+
+    ptr = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
+    );
+    
+    float* result = reinterpret_cast<float*>(ptr);
+    ptr += Br * sizeof(float);
+
+    const long long base = (long long)batchid * numhead * headdim * seqlen + 
+                                (long long)headid * headdim * seqlen;
+    const __half* INptr  = input + base;
+    
 }
