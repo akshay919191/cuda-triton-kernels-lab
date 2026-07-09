@@ -67,12 +67,17 @@ __global__ void rmsfwd_kernel(
     ptr += Br * sizeof(float);
         /// launch with number of rows actually needed so no loop
         /// const int rowitr = tileid;   use tile id instead of new var
-    for (int i = tid; i < headdim / 8; i += blockDim.x)
-    {
-    FLOAT4(gamma[i * 8]) = CFLOAT4(gammaGlobal[i * 8]);
-        }
+    int vec_elems = headdim / 8;  
+
+    for (int i = tid; i < vec_elems; i += blockDim.x) {
+        FLOAT4(gamma[i * 8]) = CFLOAT4(gammaGlobal[i * 8]);
+    }
+
+    for (int i = vec_elems * 8 + tid; i < headdim; i += blockDim.x) {
+        gamma[i] = gammaGlobal[i];
+    }
     __syncthreads();
-    cpasynccopyRMS<seqlen , headdim>(
+    cpasynccopyRMS<Br , seqlen , headdim>(
         INptr,
         Asmem,
         headdim + PADDING,
@@ -184,5 +189,30 @@ __global__ void rmsbwd_kernel(
     const long long base = (long long)batchid * numhead * headdim * seqlen + 
                                 (long long)headid * headdim * seqlen;
     const __half* INptr  = input + base;
+    const __half* Fptr   = dl_final + base;
+
+    int vec_elems = headdim / 8;  // Number of full 8-element chunks
+
+    for (int i = tid; i < vec_elems; i += blockDim.x) {
+        FLOAT4(gamma[i * 8]) = CFLOAT4(gammaGlobal[i * 8]);
+    }
+
+    for (int i = vec_elems * 8 + tid; i < headdim; i += blockDim.x) {
+        gamma[i] = gammaGlobal[i];
+    }
+
+    cpasynccopyRMS<Br , seqlen , headdim>(
+        INptr,
+        dl_in,
+        headdim + PADDING,
+        tileid
+    );
+    asm volatile("cp.async.commit_group;\n");
+
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    __syncthreads();
+
+    multiWarpReductionSUM_RMS(dl_in , result , headdim , Br);
+    __syncthreads();
     
 }

@@ -15,7 +15,7 @@
 
 // Private helpers for rmsnorm kernel only.
 
-template<int rows , int cols>
+template<int Br , int rows , int cols>
 __device__ __forceinline__ void cpasynccopyRMS(
     const __half* __restrict__ input,
           __half* __restrict__ out,    /// 4 * N  ---shared mem
@@ -27,7 +27,7 @@ __device__ __forceinline__ void cpasynccopyRMS(
 
     /// iterations calc
     constexpr int numperitr = 8; /// 16 byte means 8 halfs(each half 2 byte)
-    constexpr int totalitr  = (4 * cols) / numperitr;
+    constexpr int totalitr  = (Br * cols) / numperitr;
 
     /// this works on 16 byte alignment
 
