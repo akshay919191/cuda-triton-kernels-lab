@@ -123,7 +123,7 @@ __global__ void rmsfwd_kernel(
 
 template<int Br , int seqlen , int headdim , int numhead>
 __global__ void rmsbwd_kernel(
-    const __half* __restrict__ dl_final,
+    const __half* __restrict__ dl_final_out,
     const __half* __restrict__ input,
     const __half* __restrict__ gammaGlobal,
           __half* __restrict__ dl_dx,
@@ -149,21 +149,21 @@ __global__ void rmsbwd_kernel(
     );
 
     __half* dl_in = reinterpret_cast<__half*>(ptr);
-    ptr += Br * (headdim + PADDING);
+    ptr += Br * (headdim + PADDING) * sizeof(__half);
 
     ptr = reinterpret_cast<char*>(
         (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31
     );
     
     __half* dl_final = reinterpret_cast<__half*>(ptr);
-    ptr += Br * (headdim + PADDING);
+    ptr += Br * (headdim + PADDING) * sizeof(__half);
 
     ptr = reinterpret_cast<char*>(
         (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31
     );
     
     __half* dl_O = reinterpret_cast<__half*>(ptr);
-    ptr += Br * (headdim + PADDING);
+    ptr += Br * (headdim + PADDING) * sizeof(__half);
 
     //// we need atleast 2-3 element wise multiplication so we will write it down in our helper header
     ptr = reinterpret_cast<char*>(
@@ -187,8 +187,8 @@ __global__ void rmsbwd_kernel(
     const long long base = (long long)batchid * numhead * headdim * seqlen + 
                                 (long long)headid * headdim * seqlen;
     const __half* INptr  = input + base;
-    const __half* Fptr   = dl_final + base;
-    const __half* out    = dl_dx + base;
+    const __half* Fptr   = dl_final_out + base;
+          __half* out    = dl_dx + base;
     
 
     int vec_elems = headdim / 8;  // Number of full 8-element chunks
@@ -258,3 +258,5 @@ __global__ void rmsbwd_kernel(
         out[r * headdim + c] = dl_O[r * headdim + c] - (dl_in[r * headdim + c] * summat[r]);
     }
 }
+
+
