@@ -3,15 +3,14 @@
 
 std::vector<torch::Tensor> rmsnorm_forward_cuda(
     torch::Tensor x,
-    torch::Tensor weight,
+    torch::Tensor gamma,
     double eps
 );
 
 std::vector<torch::Tensor> rmsnorm_backward_cuda(
     torch::Tensor dy,
     torch::Tensor x,
-    torch::Tensor weight,
-    torch::Tensor inv_rms,
+    torch::Tensor gamma,
     double eps
 );
 
