@@ -13,12 +13,11 @@
 #define FLOAT4(x)  (*reinterpret_cast<float4*>(&(x)))
 #define CFLOAT4(x) (*reinterpret_cast<const float4*>(&(x)))
 
-
 ///
 template<int Br>
 __global__ void gelufwd_kernel(
     const __half* __restrict__ input,
-    const __half* __restrict__ output ,
+          __half* __restrict__ output ,
     const int seqlen , const int headdim , const int numhead
 )
 {
@@ -64,7 +63,7 @@ __global__ void gelufwd_kernel(
     if (globalRow >= seqlen) continue;   
     FLOAT4(outptr[globalRow * headdim + c8 * 8]) = CFLOAT4(smemA[row * rowStride + c8 * 8]);
     }
-    
+
     for (int i = headdim * Br + tid; i < Br * headdim; i += blockDim.x)
     {
         int row = i / headdim;
@@ -81,3 +80,12 @@ __global__ void gelufwd_kernel(
     }
 }
 
+template<int Br>
+__global__ void gelubwd_kernel(
+    const __half* __restrict__ input,
+         __half* __restrict__ output ,
+    const int seqlen , const int headdim , const int numhead
+)
+{
+    int tid = threadIdx.x;
+}
