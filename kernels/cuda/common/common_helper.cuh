@@ -117,3 +117,76 @@ void multiWarpReductionMax_half2(
         out[warpid] = localMax;
 }
 
+template<int Br>
+__device__ __forceinline__ void cpasynccopy(
+    const __half* __restrict__ input,
+          __half* __restrict__ out,
+          int stride,
+          int itr,
+          int rows,
+          int cols
+)
+{
+    int tid = threadIdx.x;
+
+    constexpr int numperitr = 8; // 16 bytes = 8 halfs
+
+    if ((cols & 7) == 0)
+    {
+        int vec_cols = cols / numperitr;
+        int total_vec = Br * vec_cols;
+
+        for (int i = tid; i < total_vec; i += blockDim.x)
+        {
+            int logical_row = i / vec_cols;
+            int vec_id      = i % vec_cols;
+
+            int logical_col = vec_id * numperitr;
+
+            int actual_row = logical_row + itr * Br;
+            int actual_col = logical_col;
+
+            uint32_t smem_addr = static_cast<uint32_t>(
+                __cvta_generic_to_shared(out + logical_row * stride + logical_col)
+            );
+
+            bool isvalid = actual_row < rows;
+
+            const __half* global_src =
+                isvalid ? input + (size_t)actual_row * cols + actual_col : input;
+
+            int predicate = isvalid ? 1 : 0;
+
+            asm volatile(
+                "{\n"
+                "  .reg .pred p;\n"
+                "  .reg .u32 z;\n"
+                "  mov.u32 z, 0;\n"
+                "  setp.ne.b32 p, %2, 0;\n"
+                "  @p  cp.async.cg.shared.global [%0], [%1], 16;\n"
+                "  @!p st.shared.v4.b32 [%0], {z, z, z, z};\n"
+                "}\n"
+                :
+                : "r"(smem_addr), "l"(global_src), "r"(predicate)
+                : "memory"
+            );
+        }
+    }
+    else
+    {
+        for (int i = tid; i < Br * cols; i += blockDim.x)
+        {
+            int logical_row = i / cols;
+            int logical_col = i % cols;
+
+            int actual_row = logical_row + itr * Br;
+
+            if (actual_row < rows) {
+                out[logical_row * stride + logical_col] =
+                    input[(size_t)actual_row * cols + logical_col];
+            } else {
+                out[logical_row * stride + logical_col] = __float2half(0.0f);
+            }
+        }
+    }
+}

@@ -46,7 +46,7 @@ __global__ void gelufwd_kernel(
     __half* smemA = reinterpret_cast<__half*>(ptr);
     ptr += Br * (headdim + PADDING) * sizeof(__half);
 
-    cpasynccopygelu<Br>(INptr , smemA , headdim + PADDING , tileid , seqlen , headdim);
+    cpasynccopy<Br>(INptr , smemA , headdim + PADDING , tileid , seqlen , headdim);
     asm volatile("cp.async.commit_group;\n");
     asm volatile("cp.async.wait_group 0;\n");
 
@@ -112,10 +112,10 @@ __global__ void gelubwd_kernel(
     __half* upstream = reinterpret_cast<__half*>(ptr);
     ptr += Br * (headdim + PADDING) * sizeof(__half);
 
-    cpasynccopygelu<Br>(prevv , upstream , headdim + PADDING , tileid , seqlen , headdim);
+    cpasynccopy<Br>(prevv , upstream , headdim + PADDING , tileid , seqlen , headdim);
     asm volatile("cp.async.commit_group;\n");
 
-    cpasynccopygelu<Br>(INptr , smemA , headdim + PADDING , tileid , seqlen , headdim);
+    cpasynccopy<Br>(INptr , smemA , headdim + PADDING , tileid , seqlen , headdim);
     asm volatile("cp.async.commit_group;\n");
 
     asm volatile("cp.async.wait_group 0;\n");
