@@ -49,5 +49,21 @@ __global__ void Silufwd_kernel(
     asm volatile("cp.async.commit_group;\n");
     asm volatile("cp.async.wait_group 0;\n");
 
-    
+    __syncthreads();
+    doSILU<Br>(smemA , seqlen , headdim , rowstride);
+    __syncthreads();
+
+    for(int i = tid ; i < Br * headdim ; i += blockDim.x)
+    {
+        int r = i / headdim;
+        int c = i % headdim;
+
+        int smemidx = r * rowstride + c;
+        int globalRow = Br * tileid + r;
+
+        if (globalRow >= seqlen) continue;
+
+        outptr[globalRow * headdim + col] =
+            smemA[smemidx];
+    }
 }
