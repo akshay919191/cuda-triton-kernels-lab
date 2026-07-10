@@ -2,7 +2,6 @@
 
 #include "../common/common_helper.cuh"
 
-
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -11,9 +10,27 @@
 #include <stdint.h>
 #include <float.h>
 
-/// we will force it for softmax
+
+__device__ __forceinline__ float warp_reduce_sum_softmax(float val)
+{
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+
+__device__ __forceinline__ float warp_reduce_max_softmax(float val)
+{
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+
 __device__ __forceinline__
-void multiWarpReduction_softmax(
+void multiWarpReductionSUM_softmax_plain(
     const __half* __restrict__ input,
     float* __restrict__ out,
     int cols,
@@ -28,57 +45,96 @@ void multiWarpReduction_softmax(
 
     for (int row = warpid; row < Br; row += numWarps)
     {
-        const __half* rowPtr = input + row * rowStride;
+        float localSum = 0.0f;
 
-        float localsum = 0.0f;
-
-        const half2* rowPtr2 = reinterpret_cast<const half2*>(rowPtr);
-        int cols2 = cols >> 1;
-
-        for (int i = lane; i < cols2; i += WARP_SIZE)
+        for (int c = lane; c < cols; c += 32)
         {
-            half2 h = rowPtr2[i];
-            float2 f = __half22float2(h);
-
-            localsum += expf(f.x - out[row]);
-            localsum += expf(f.y - out[row]);
+            localSum += __half2float(input[row * rowStride + c]);
         }
 
-        localsum = reducesum(localsum);
+        float sum = warp_reduce_sum_softmax(localSum);
 
-        if (lane == 0)
-            out[row] = localsum;
+        if (lane == 0) {
+            out[row] = sum;
+        }
     }
 }
 
+
+// stable softmax over each row
 template<int Br>
-__device__ __shared__ void dosoftmax(
+__device__ __forceinline__ void dosoftmax(
     __half* __restrict__ data,
-    float*  __restrict__ rsult1,
-    float*  __restrict__ rsult2,
-    int headdim , int seqlen , int rowstride
+    float* __restrict__ rowMax,
+    float* __restrict__ rowSum,
+    int headdim,
+    int seqlen,
+    int rowstride
 )
 {
-    int tid = threadIdx.x;
+    int tid      = threadIdx.x;
+    int lane     = tid & 31;
+    int warpid   = tid >> 5;
+    int numWarps = blockDim.x >> 5;
 
-    //// we will store all max in rsult , and then overwrite it with actual each row sum using this multiWarpReductionMax_half2
-    multiWarpReductionMax_half2(data , rsult1 , headdim , rowstride , Br);
-    __syncthreads();
-    
-    for(int i = tid ; i < Br ; i += blockDim.x) rsult2[i] = rsult1[i]; __syncthreads();
-
-    //// now this function gives sum for each row with numerical stablity
-    multiWarpReduction_softmax(data , rsult1 , headdim , rowstride , Br);
-    __syncthreads();
-
-    for(int i = tid ; i < Br * headdim ; i += blockDim.x)
+    // row max
+    for (int row = warpid; row < Br; row += numWarps)
     {
-        int r = i / headdim;
-        int c = i % headdim;
+        float localMax = -FLT_MAX;
 
-        int smemidx = r * rowstride + c;
+        for (int c = lane; c < headdim; c += 32)
+        {
+            float x = __half2float(data[row * rowstride + c]);
+            localMax = fmaxf(localMax, x);
+        }
 
-        data[smemidx] = __float2half((__half2float(data[smemidx]) - rsult2[r]) / rsult1[r]);
+        float m = warp_reduce_max_softmax(localMax);
+
+        if (lane == 0) {
+            rowMax[row] = m;
+        }
     }
 
+    __syncthreads();
+
+    for (int row = warpid; row < Br; row += numWarps)
+    {
+        float m = rowMax[row];
+        float localSum = 0.0f;
+
+        for (int c = lane; c < headdim; c += 32)
+        {
+            int idx = row * rowstride + c;
+
+            float x = __half2float(data[idx]);
+            float e = expf(x - m);
+
+            data[idx] = __float2half(e);
+            localSum += e;
+        }
+
+        float s = warp_reduce_sum_softmax(localSum);
+
+        if (lane == 0) {
+            rowSum[row] = s;
+        }
+    }
+
+    __syncthreads();
+
+    // 3. normalize
+    for (int row = warpid; row < Br; row += numWarps)
+    {
+        float invSum = 1.0f / rowSum[row];
+
+        for (int c = lane; c < headdim; c += 32)
+        {
+            int idx = row * rowstride + c;
+
+            float e = __half2float(data[idx]);
+            data[idx] = __float2half(e * invSum);
+        }
+    }
+
+    __syncthreads();
 }

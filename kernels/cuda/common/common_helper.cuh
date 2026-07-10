@@ -122,7 +122,7 @@ void multiWarpReductionMax_half2(
         localMax = warpReduceMax(localMax);
 
         if (lane == 0)
-            out[row] = localsum;
+            out[row] = localMax;
     }
 }
 
