@@ -132,6 +132,7 @@ __global__ void gelubwd_kernel(
     __syncthreads();
 
     performGelubck<Br>(smemA , upstream , headdim + PADDING , headdim);
+    __syncthreads();
 
     for (int i = headdim * Br + tid; i < Br * headdim; i += blockDim.x)
     {
