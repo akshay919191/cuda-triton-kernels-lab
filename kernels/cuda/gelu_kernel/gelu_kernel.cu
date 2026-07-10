@@ -35,5 +35,49 @@ __global__ void gelufwd_kernel(
     const __half* INptr  = input + base;
     __half* outptr = output + base;
 
+    extern __shared__ char smem[];
+
+    char* ptr = smem;
+
+    ptr = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
+    );
+
+    __half* smemA = reinterpret_cast<__half*>(ptr);
+    ptr += Br * (headdim + PADDING) * sizeof(__half);
+
+    cpasynccopygelu<Br>(INptr , smemA , headdim + PADDING , tileid , seqlen , headdim);
+    asm volatile("cp.async.commit_group;\n");
+    asm volatile("cp.async.wait_group 0;\n");
+
+    __syncthreads();
+
+    performGelu<Br>(smemA , headdim + PADDING , headdim);
+    __syncthreads();
+
+    /// now the activated terms are in smemA , save it globally
+    for (int i = tid; i < Br * (headdim / 8); i += blockDim.x)
+    {
+    int row = i / (headdim / 8);
+    int c8  = i % (headdim / 8);
+    int globalRow = tileid * Br + row;
+    if (globalRow >= seqlen) continue;   
+    FLOAT4(outptr[globalRow * headdim + c8 * 8]) = CFLOAT4(smemA[row * rowStride + c8 * 8]);
+    }
     
+    for (int i = headdim * Br + tid; i < Br * headdim; i += blockDim.x)
+    {
+        int row = i / headdim;
+        int col = i % headdim;
+
+        if (col < headdim)
+            continue;   
+        int globalRow = tileid * Br + row;
+        if (globalRow >= seqlen)
+            continue;
+
+        outptr[globalRow * headdim + col] =
+            smemA[row * rowStride + col];
+    }
 }
+
