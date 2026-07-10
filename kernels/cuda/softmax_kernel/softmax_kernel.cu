@@ -46,8 +46,32 @@ __global__ void softmaxfwd_kernel(
         (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
     );
 
-    __half* res = reinterpret_cast<float*>(ptr);
+    __half* res1 = reinterpret_cast<float*>(ptr);
     ptr += Br * sizeof(float);
 
+    __half* res2 = reinterpret_cast<float*>(ptr);
+    ptr += Br * sizeof(float);
+
+    cpasynccopy<Br>(INptr , smemA , rowstride , tileid , seqlen , headdim);
+    asm volatile("cp.async.commit_group;\n");
+
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+
+    dosoftmax<Br>(smemA , res1 , res2 , headdim , seqlen , rowstride);
+    __syncthreads();
+
+    for (int i = tid; i < Br * headdim; i += blockDim.x)
+    {
+        int r = i / headdim;
+        int c = i % headdim;
+
+        int globalRow = tileid * Br + r;
+        if (globalRow >= seqlen) continue;
+
+        int smemidx = r * rowstride + c;
+
+        outptr[globalRow * headdim + c] = smemA[smemidx];
+    }
     
 }

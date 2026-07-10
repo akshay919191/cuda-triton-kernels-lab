@@ -38,37 +38,42 @@ float reducesum(float val)
 }
 
 __device__ __forceinline__
-void multiWarpReductionSUM_half2(
+void multiWarpReductionSUM(
     const __half* __restrict__ input,
     float* __restrict__ out,
-    int cols)
+    int cols,
+    int rowStride,
+    int Br
+)
 {
-    int tid    = threadIdx.x;
-    int lane   = tid & 31;
-    int warpid = tid >> 5;
+    int tid      = threadIdx.x;
+    int lane     = tid & 31;
+    int warpid   = tid >> 5;
+    int numWarps = blockDim.x >> 5;
 
-    const __half* rowPtr = input + warpid * cols;
-
-    float localsum = 0;
-
-    const half2* rowPtr2 = reinterpret_cast<const half2*>(rowPtr);
-
-    int cols2 = cols >> 1;          // cols / 2
-
-    for (int i = lane; i < cols2; i += WARP_SIZE)
+    for (int row = warpid; row < Br; row += numWarps)
     {
-        half2 h = rowPtr2[i];
+        const __half* rowPtr = input + row * rowStride;
 
-        float2 f = __half22float2(h);
+        float localsum = 0.0f;
 
-        localsum += f.x;
-        localsum += f.y;
+        const half2* rowPtr2 = reinterpret_cast<const half2*>(rowPtr);
+        int cols2 = cols >> 1;
+
+        for (int i = lane; i < cols2; i += WARP_SIZE)
+        {
+            half2 h = rowPtr2[i];
+            float2 f = __half22float2(h);
+
+            localsum += f.x;
+            localsum += f.y;
+        }
+
+        localsum = reducesum(localsum);
+
+        if (lane == 0)
+            out[row] = localsum;
     }
-
-    localsum = reducesum(localsum);
-
-    if (lane == 0)
-        out[warpid] = localsum;
 }
 
 
