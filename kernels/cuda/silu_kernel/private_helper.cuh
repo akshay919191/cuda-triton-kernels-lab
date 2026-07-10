@@ -4,58 +4,76 @@
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
-#include <stdio.h>
 #include <cuda_fp16.h>
-#include <stdint.h>
 #include <cuda.h>
 #include <math.h>
+#include <stdint.h>
 #include <float.h>
 
-static inline float silu(float x) {
-    return x / (1.0f + expf(-x));
-}
-
-static inline float SILU_BWD(float x)
+__device__ __forceinline__ float silu_fwd_float(float x)
 {
     float s = 1.0f / (1.0f + expf(-x));
+    return x * s;
+}
+
+__device__ __forceinline__ float silu_bwd_float(float x)
+{
+    float s = 1.0f / (1.0f + expf(-x));
+
+    // d/dx [x * sigmoid(x)]
+    // = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
     return s * (1.0f + x * (1.0f - s));
 }
+
 
 template<int Br>
 __device__ __forceinline__ void doSILU(
     __half* __restrict__ data,
-    int seqlen , int headdim , int rowstride
+    int rowStride,
+    int headdim
 )
 {
     int tid = threadIdx.x;
-    for(int i = tid ; i < Br * headdim ; i += blockDim.x)
+
+    for (int i = tid; i < Br * headdim; i += blockDim.x)
     {
-        int r = i / headdim; 
+        int r = i / headdim;
         int c = i % headdim;
 
-        int smemidx = r * rowstride + c;
-        if(smemidx >= seqlen) break;
+        int idx = r * rowStride + c;
 
-        data[smemidx] = __float2half(silu(__half2float(data[smemidx])));
+        float x = __half2float(data[idx]);
+        float s = 1.0f / (1.0f + expf(-x));
+        float y = x * s;
+
+        data[idx] = __float2half(y);
     }
 }
 
+
 template<int Br>
 __device__ __forceinline__ void doSILUbck(
-    const __half* __restrict__ dy,
     __half* __restrict__ data,
-    int seqlen , int headdim , int rowstride
+    const __half* __restrict__ upstream,
+    int rowStride,
+    int headdim
 )
 {
     int tid = threadIdx.x;
-    for(int i = tid ; i < Br * headdim ; i += blockDim.x)
+
+    for (int i = tid; i < Br * headdim; i += blockDim.x)
     {
-        int r = i / headdim; 
+        int r = i / headdim;
         int c = i % headdim;
 
-        int smemidx = r * rowstride + c;
-        if(smemidx >= seqlen) break;
+        int idx = r * rowStride + c;
 
-        data[smemidx] = __float2half(SILU_BWD(__half2float(data[smemidx])) * __half2float(dy[smemidx]));
+        float x  = __half2float(data[idx]);
+        float dy = __half2float(upstream[idx]);
+
+        float s = 1.0f / (1.0f + expf(-x));
+        float grad = s * (1.0f + x * (1.0f - s));
+
+        data[idx] = __float2half(dy * grad);
     }
 }
