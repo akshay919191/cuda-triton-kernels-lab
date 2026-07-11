@@ -34,7 +34,7 @@ __global__ void fusedgelufwd_kernel(
 
     const __half* INptr  = input + base;
           __half* outptr = output + base;
-    const float*  biasp  = bias;              // fixed: was float* (dropped const)
+    const float*  biasp  = bias;              
     const int rowStride = headdim + PADDING;
 
     extern __shared__ char smem[];
@@ -51,7 +51,7 @@ __global__ void fusedgelufwd_kernel(
     float* biass = reinterpret_cast<float*>(ptr);
     ptr += headdim * sizeof(float);
 
-    for(int i = tid ; i < headdim ; i += blockDim.x) biass[i] = biasp[i];  // fixed: was `= biasp;`
+    for(int i = tid ; i < headdim ; i += blockDim.x) biass[i] = biasp[i];  
 
     __syncthreads();
 
@@ -92,8 +92,11 @@ __global__ void fusedgelubwd_kernel(
     const __half* __restrict__ input,
     const __half* __restrict__ dl_dy,
     const float*  __restrict__ bias,
-          __half* __restrict__ output ,
-    const int seqlen , const int headdim , const int numhead
+          __half* __restrict__ output,
+          float*  __restrict__ dl_bias,
+    const int seqlen,
+    const int headdim,
+    const int numhead
 )
 {
     int tid = threadIdx.x;
@@ -109,7 +112,7 @@ __global__ void fusedgelubwd_kernel(
 
     const __half* INptr  = input  + base;
     const __half* prevv  = dl_dy  + base;
-    const float*  biasp  = bias;              // fixed: was float* (dropped const)
+    const float*  biasp  = bias;              
     
           __half* outptr = output + base;
 
@@ -134,7 +137,7 @@ __global__ void fusedgelubwd_kernel(
     float* biass = reinterpret_cast<float*>(ptr);
     ptr += headdim * sizeof(float);
 
-    for(int i = tid ; i < headdim ; i += blockDim.x) biass[i] = biasp[i];  // fixed: was `= biasp;`
+    for(int i = tid ; i < headdim ; i += blockDim.x) biass[i] = biasp[i];  
 
     __syncthreads();
 
@@ -169,8 +172,11 @@ __global__ void fusedgelubwd_kernel(
         int globalRow = tileid * Br + row;
         if (globalRow >= seqlen) continue;
 
-        outptr[globalRow * headdim + col] =
-            smemA[row * rowStride + col];
+        float dx_val = __half2float(smemA[row * rowStride + col]);
+
+        atomicAdd(&dl_bias[col], dx_val);
+
+        outptr[globalRow * headdim + col] = __float2half(dx_val);
     }
 }
 
@@ -210,7 +216,7 @@ static inline size_t gelu_bwd_smem_bytes(int D) {
 }
 
 template<int Br>
-std::vector<torch::Tensor> gelu_forward_launch(torch::Tensor x , torch::Tensor b) {
+std::vector<torch::Tensor> fused_bias_gelu_forward_launch(torch::Tensor x, torch::Tensor b){
     CHECK_INPUT(x);
     CHECK_INPUT(b);   // added: bias was never validated
 
@@ -241,7 +247,7 @@ std::vector<torch::Tensor> gelu_forward_launch(torch::Tensor x , torch::Tensor b
 
     fusedgelufwd_kernel<Br><<<grid, block, smem>>>(
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
-        b.data_ptr<float>(),                       // fixed: was reinterpret_cast<const float>(b.data_ptr)
+        b.data_ptr<float>(),                      
         reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
         N,
         D,
@@ -254,14 +260,14 @@ std::vector<torch::Tensor> gelu_forward_launch(torch::Tensor x , torch::Tensor b
 }
 
 template<int Br>
-std::vector<torch::Tensor> gelu_backward_launch(
+std::vector<torch::Tensor> fused_bias_gelu_backward_launch(
     torch::Tensor dy,
     torch::Tensor x,
     torch::Tensor b
 ) {
     CHECK_INPUT(dy);
     CHECK_INPUT(x);
-    CHECK_INPUT(b);   // added
+    CHECK_INPUT(b);
 
     TORCH_CHECK(dy.scalar_type() == torch::kFloat16, "dy must be float16");
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
@@ -276,6 +282,12 @@ std::vector<torch::Tensor> gelu_backward_launch(
     const int D = x.size(3);
 
     auto dx = torch::empty_like(x);
+
+    auto opts_f32 = torch::TensorOptions()
+        .device(x.device())
+        .dtype(torch::kFloat32);
+
+    auto dbias = torch::zeros({D}, opts_f32);
 
     dim3 grid(B, H, (N + Br - 1) / Br);
     dim3 block(256);
@@ -293,8 +305,9 @@ std::vector<torch::Tensor> gelu_backward_launch(
     fusedgelubwd_kernel<Br><<<grid, block, smem>>>(
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(dy.data_ptr<at::Half>()),
-        b.data_ptr<float>(),                       // fixed
+        b.data_ptr<float>(),
         reinterpret_cast<__half*>(dx.data_ptr<at::Half>()),
+        dbias.data_ptr<float>(),
         N,
         D,
         H
@@ -302,17 +315,21 @@ std::vector<torch::Tensor> gelu_backward_launch(
 
     CUDA_CHECK(cudaGetLastError());
 
-    return {dx};
+    return {dx, dbias};
 }
 
-std::vector<torch::Tensor> gelu_forward_cuda(torch::Tensor x , torch::Tensor b) {
-    return gelu_forward_launch<16>(x , b);
+std::vector<torch::Tensor> fused_bias_gelu_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor b
+) {
+    return fused_bias_gelu_forward_launch<16>(x, b);
 }
 
-std::vector<torch::Tensor> gelu_backward_cuda(
+
+std::vector<torch::Tensor> fused_bias_gelu_backward_cuda(
     torch::Tensor dy,
     torch::Tensor x,
     torch::Tensor b
 ) {
-    return gelu_backward_launch<16>(dy, x , b);
+    return fused_bias_gelu_backward_launch<16>(dy, x, b);
 }
