@@ -1,11 +1,12 @@
 #include <torch/extension.h>
 #include <vector>
 
-std::vector<torch::Tensor> fused_bias_gelu_forward_cuda(torch::Tensor x);
+std::vector<torch::Tensor> fused_bias_gelu_forward_cuda(torch::Tensor x , torch::Tensor b);
 
 std::vector<torch::Tensor> fused_bias_gelu_backward_cuda(
     torch::Tensor dy,
-    torch::Tensor x
+    torch::Tensor x,
+    torch::Tensor b
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

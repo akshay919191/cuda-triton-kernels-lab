@@ -13,25 +13,25 @@
 
 #include <math.h>
 
-static inline float U(float x)
+__device__ __forceinline__ float U(float x)
 {
     return 0.7978845608028654f * (x + 0.044715f * x * x * x);
 }
 
-static inline float DU(float x)
+__device__ __forceinline__ float DU(float x)
 {
     return 0.7978845608028654f * (1.0f + 0.134145f * x * x);
 }
 
-static inline float GELU(float x)
+__device__ __forceinline__ float GELU(float x)
 {
     return 0.5f * x * (1.0f + tanhf(U(x)));
 }
 
-static inline float GELU_BWD(float x)
+__device__ __forceinline__ float GELU_BWD(float x)
 {
     float ux = U(x);
-    float t = tanhf(ux);
+    float t  = tanhf(ux);
 
     return 0.5f * (1.0f + t)
          + 0.5f * x * (1.0f - t * t) * DU(x);
