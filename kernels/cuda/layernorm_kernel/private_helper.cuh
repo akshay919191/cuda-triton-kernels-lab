@@ -13,6 +13,19 @@
 #include <float.h>
 
 
+#pragma once
+
+#include "../common/common_helper.cuh"
+
+#include <cuda_runtime.h>
+#include <stdio.h>
+#include <cuda_fp16.h>
+#include <stdint.h>
+#include <cuda.h>
+#include <math.h>
+#include <float.h>
+
+
 __device__ __forceinline__
 void multiWarpReductionMEAN(
     const __half* __restrict__ input,
@@ -31,60 +44,55 @@ void multiWarpReductionMEAN(
     {
         const __half* rowPtr = input + row * rowStride;
 
-        float localsum = 0.0f;
+        float localSum = 0.0f;
 
-        const half2* rowPtr2 = reinterpret_cast<const half2*>(rowPtr);
-        int cols2 = cols >> 1;
-
-        for (int i = lane; i < cols2; i += WARP_SIZE)  /// warp size from common helper
+        for (int c = lane; c < cols; c += WARP_SIZE)
         {
-            half2 h = rowPtr2[i];
-            float2 f = __half22float2(h);
-
-            localsum += f.x;
-            localsum += f.y;
+            localSum += __half2float(rowPtr[c]);
         }
 
-        localsum = reducesum(localsum);
+        localSum = reducesum(localSum);
 
-        if (lane == 0)
-            out[row] = localsum / cols;
+        if (lane == 0) {
+            out[row] = localSum / (float)cols;
+        }
     }
 }
+
 
 __device__ __forceinline__
 void multiWarpReductionSIGMA2(
     const __half* __restrict__ input,
-    float* __restrict__ res,
+    float* __restrict__ mean,
     float* __restrict__ out,
     int cols,
     int rowStride,
     int Br
-){
+)
+{
     int tid      = threadIdx.x;
     int lane     = tid & 31;
     int warpid   = tid >> 5;
     int numWarps = blockDim.x >> 5;
 
-    for(int row = warpid ; row < Br ; row += numWarps)
+    for (int row = warpid; row < Br; row += numWarps)
     {
-        const __half* rowptr = input + row * rowStride;
+        const __half* rowPtr = input + row * rowStride;
 
-        float localsigma = 0.f;
+        float localVar = 0.0f;
+        float m = mean[row];
 
-        const half2* rowptr2 = reinterpret_cast<half2*>(rowptr);
-        int col2 = cols >> 1;
-
-        for(int i = lane ; i < col2 ; i += WARP_SIZE)
+        for (int c = lane; c < cols; c += WARP_SIZE)
         {
-            half2 h = rowptr2[i];
-            float2 f = __half22float2(h);
-
-            localsigma += (f.x - res[row]) * (f.x - res[row]);
-            localsigma += (f.y - res[row]) * (f.y - res[row]);
+            float x = __half2float(rowPtr[c]);
+            float d = x - m;
+            localVar += d * d;
         }
-        localsigma = reducesum(localsigma);
-        if(lane == 0) out[row] = localsigma / cols;
-    }
 
+        localVar = reducesum(localVar);
+
+        if (lane == 0) {
+            out[row] = localVar / (float)cols;
+        }
+    }
 }
