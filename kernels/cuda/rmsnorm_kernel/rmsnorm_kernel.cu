@@ -15,12 +15,15 @@
 /*
 mean of the whole data , wrt to col --- row wise
 */
-template<int Br, int seqlen, int headdim, int numhead>
+template<int Br>
 __global__ void rmsfwd_kernel(
     const __half* __restrict__ input,
     __half* __restrict__ output,
     float eps,
-    const __half* __restrict__ gammaGlobal
+    const __half* __restrict__ gammaGlobal,
+    const int seqlen,
+    const int headdim,
+    const int numhead
 )
 {
     int tid    = threadIdx.x;
@@ -78,11 +81,13 @@ __global__ void rmsfwd_kernel(
         gamma[i] = gammaGlobal[i];
     }
     __syncthreads();
-    cpasynccopyRMS<Br , seqlen , headdim>(
+    cpasynccopyRMS<Br>(
         INptr,
         Asmem,
         headdim + PADDING,
-        tileid
+        tileid,
+        seqlen,
+        headdim
     );
     asm volatile("cp.async.commit_group;\n");
 
@@ -122,14 +127,17 @@ __global__ void rmsfwd_kernel(
         }
 }
 
-template<int Br, int seqlen, int headdim, int numhead>
+template<int Br>
 __global__ void rmsbwd_kernel(
     const __half* __restrict__ dl_final_out,
     const __half* __restrict__ input,
     const __half* __restrict__ gammaGlobal,
     __half* __restrict__ dl_dx,
     float* __restrict__ dl_gamma,
-    float eps
+    float eps,
+    const int seqlen,
+    const int headdim,
+    const int numhead
 )
 {
     int tid    = threadIdx.x;
@@ -205,19 +213,23 @@ __global__ void rmsbwd_kernel(
         gamma[i] = gammaGlobal[i];
     }
 
-    cpasynccopyRMS<Br , seqlen , headdim>(
+    cpasynccopyRMS<Br>(
         INptr,
         dl_in,
         headdim + PADDING,
-        tileid
+        tileid,
+        seqlen,
+        headdim
     );
     asm volatile("cp.async.commit_group;\n");
 
-    cpasynccopyRMS<Br , seqlen , headdim>(
+    cpasynccopyRMS<Br>(
         Fptr,
         dl_final,
         headdim + PADDING,
-        tileid
+        tileid,
+        seqlen,
+        headdim
     );
     asm volatile("cp.async.commit_group;\n");
 
@@ -323,67 +335,53 @@ static inline size_t align32_bytes(size_t x) {
     return (x + 31) & ~size_t(31);
 }
 
-template<int Br, int SEQLEN, int D>
-static inline size_t rmsnorm_fwd_smem_bytes() {
+template<int Br>
+static inline size_t rmsnorm_fwd_smem_bytes(int D) {
     size_t bytes = 0;
 
-    // Asmem: [Br, D + PADDING] half
     bytes = align32_bytes(bytes);
     bytes += Br * (D + PADDING) * sizeof(__half);
 
-    // gamma: [D + PADDING] half
     bytes = align32_bytes(bytes);
     bytes += (D + PADDING) * sizeof(__half);
 
-    // result: [Br] float
     bytes = align32_bytes(bytes);
     bytes += Br * sizeof(float);
 
-    // denoSmem: [Br] float
     bytes = align32_bytes(bytes);
     bytes += Br * sizeof(float);
 
-    // little safety padding for alignment movement inside kernel
     bytes += 128;
-
     return bytes;
 }
 
-template<int Br, int SEQLEN, int D>
-static inline size_t rmsnorm_bwd_smem_bytes() {
+template<int Br>
+static inline size_t rmsnorm_bwd_smem_bytes(int D) {
     size_t bytes = 0;
 
-    // dl_in: [Br, D + PADDING] half
     bytes = align32_bytes(bytes);
     bytes += Br * (D + PADDING) * sizeof(__half);
 
-    // dl_final: [Br, D + PADDING] half
     bytes = align32_bytes(bytes);
     bytes += Br * (D + PADDING) * sizeof(__half);
 
-    // dl_O: [Br, D + PADDING] half
     bytes = align32_bytes(bytes);
     bytes += Br * (D + PADDING) * sizeof(__half);
 
-    // gamma: [D + PADDING] half
     bytes = align32_bytes(bytes);
     bytes += (D + PADDING) * sizeof(__half);
 
-    // result: [Br] float
     bytes = align32_bytes(bytes);
     bytes += Br * sizeof(float);
 
-    // summat: [Br] float
     bytes = align32_bytes(bytes);
     bytes += Br * sizeof(float);
 
-    // little safety padding for alignment movement inside kernel
     bytes += 128;
-
     return bytes;
 }
 
-template<int Br, int SEQLEN, int D, int NUM_HEADS>
+template<int Br>
 std::vector<torch::Tensor> rmsnorm_forward_launch(
     torch::Tensor x,
     torch::Tensor gamma,
@@ -395,30 +393,42 @@ std::vector<torch::Tensor> rmsnorm_forward_launch(
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
     TORCH_CHECK(gamma.scalar_type() == torch::kFloat16, "gamma must be float16");
 
-    TORCH_CHECK(x.dim() == 4, "x must be [B, H, SEQLEN, D]");
+    TORCH_CHECK(x.dim() == 4, "x must be [B, H, N, D]");
     TORCH_CHECK(gamma.dim() == 1, "gamma must be [D]");
 
-    TORCH_CHECK(x.size(1) == NUM_HEADS, "x.size(1) must match NUM_HEADS");
-    TORCH_CHECK(x.size(2) == SEQLEN, "x.size(2) must match SEQLEN");
-    TORCH_CHECK(x.size(3) == D, "x.size(3) must match D");
+    const int B = x.size(0);
+    const int H = x.size(1);
+    const int N = x.size(2);
+    const int D = x.size(3);
+
     TORCH_CHECK(gamma.size(0) == D, "gamma.size(0) must match D");
 
-    TORCH_CHECK(D % 8 == 0, "D must be divisible by 8 because kernel uses float4 vectorized stores");
-
-    const int B = x.size(0);
+    // Keep this because your final global store is still FLOAT4 vectorized.
+    TORCH_CHECK(D % 8 == 0, "D must be divisible by 8 because kernel uses FLOAT4 stores");
 
     auto y = torch::empty_like(x);
 
-    dim3 grid(B, NUM_HEADS, (SEQLEN + Br - 1) / Br);
+    dim3 grid(B, H, (N + Br - 1) / Br);
     dim3 block(256);
 
-    size_t smem = rmsnorm_fwd_smem_bytes<Br, SEQLEN, D>();
+    size_t smem = rmsnorm_fwd_smem_bytes<Br>(D);
 
-    rmsfwd_kernel<Br, SEQLEN, D, NUM_HEADS><<<grid, block, smem>>>(
+    if (smem > 48 * 1024) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            rmsfwd_kernel<Br>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem)
+        ));
+    }
+
+    rmsfwd_kernel<Br><<<grid, block, smem>>>(
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
         static_cast<float>(eps),
-        reinterpret_cast<const __half*>(gamma.data_ptr<at::Half>())
+        reinterpret_cast<const __half*>(gamma.data_ptr<at::Half>()),
+        N,
+        D,
+        H
     );
 
     CUDA_CHECK(cudaGetLastError());
@@ -426,8 +436,7 @@ std::vector<torch::Tensor> rmsnorm_forward_launch(
     return {y};
 }
 
-
-template<int Br, int SEQLEN, int D, int NUM_HEADS>
+template<int Br>
 std::vector<torch::Tensor> rmsnorm_backward_launch(
     torch::Tensor dy,
     torch::Tensor x,
@@ -442,34 +451,44 @@ std::vector<torch::Tensor> rmsnorm_backward_launch(
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
     TORCH_CHECK(gamma.scalar_type() == torch::kFloat16, "gamma must be float16");
 
-    TORCH_CHECK(x.dim() == 4, "x must be [B, H, SEQLEN, D]");
+    TORCH_CHECK(x.dim() == 4, "x must be [B, H, N, D]");
     TORCH_CHECK(dy.sizes() == x.sizes(), "dy shape must match x");
     TORCH_CHECK(gamma.dim() == 1, "gamma must be [D]");
 
-    TORCH_CHECK(x.size(1) == NUM_HEADS, "x.size(1) must match NUM_HEADS");
-    TORCH_CHECK(x.size(2) == SEQLEN, "x.size(2) must match SEQLEN");
-    TORCH_CHECK(x.size(3) == D, "x.size(3) must match D");
-    TORCH_CHECK(gamma.size(0) == D, "gamma.size(0) must match D");
-
-    TORCH_CHECK(D % 8 == 0, "D must be divisible by 8 because kernel uses float4 vectorized ops");
-
     const int B = x.size(0);
+    const int H = x.size(1);
+    const int N = x.size(2);
+    const int D = x.size(3);
+
+    TORCH_CHECK(gamma.size(0) == D, "gamma.size(0) must match D");
+    TORCH_CHECK(D % 8 == 0, "D must be divisible by 8 because kernel uses vectorized ops");
 
     auto dx = torch::empty_like(x);
     auto dgamma = torch::zeros({D}, x.options().dtype(torch::kFloat32));
 
-    dim3 grid(B, NUM_HEADS, (SEQLEN + Br - 1) / Br);
+    dim3 grid(B, H, (N + Br - 1) / Br);
     dim3 block(256);
 
-    size_t smem = rmsnorm_bwd_smem_bytes<Br, SEQLEN, D>();
+    size_t smem = rmsnorm_bwd_smem_bytes<Br>(D);
 
-    rmsbwd_kernel<Br, SEQLEN, D, NUM_HEADS><<<grid, block, smem>>>(
+    if (smem > 48 * 1024) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            rmsbwd_kernel<Br>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem)
+        ));
+    }
+
+    rmsbwd_kernel<Br><<<grid, block, smem>>>(
         reinterpret_cast<const __half*>(dy.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(gamma.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(dx.data_ptr<at::Half>()),
         dgamma.data_ptr<float>(),
-        static_cast<float>(eps)
+        static_cast<float>(eps),
+        N,
+        D,
+        H
     );
 
     CUDA_CHECK(cudaGetLastError());
@@ -477,54 +496,13 @@ std::vector<torch::Tensor> rmsnorm_backward_launch(
     return {dx, dgamma};
 }
 
-
 std::vector<torch::Tensor> rmsnorm_forward_cuda(
     torch::Tensor x,
     torch::Tensor gamma,
     double eps
 ) {
-    const int H = x.size(1);
-    const int N = x.size(2);
-    const int D = x.size(3);
-
-    // Change these to the shapes you actually want to support first.
-    // Start small. Do not support 50 shapes on day 1.
-
-    if (H == 1 && N == 128 && D == 64) {
-        return rmsnorm_forward_launch<16, 128, 64, 1>(x, gamma, eps);
-    }
-
-    if (H == 1 && N == 256 && D == 64) {
-        return rmsnorm_forward_launch<16, 256, 64, 1>(x, gamma, eps);
-    }
-
-    if (H == 1 && N == 512 && D == 64) {
-        return rmsnorm_forward_launch<16, 512, 64, 1>(x, gamma, eps);
-    }
-
-    if (H == 1 && N == 1024 && D == 64) {
-        return rmsnorm_forward_launch<16, 1024, 64, 1>(x, gamma, eps);
-    }
-
-    if (H == 1 && N == 128 && D == 128) {
-        return rmsnorm_forward_launch<16, 128, 128, 1>(x, gamma, eps);
-    }
-
-    if (H == 1 && N == 256 && D == 128) {
-        return rmsnorm_forward_launch<16, 256, 128, 1>(x, gamma, eps);
-    }
-
-    if (H == 1 && N == 512 && D == 128) {
-        return rmsnorm_forward_launch<16, 512, 128, 1>(x, gamma, eps);
-    }
-
-    if (H == 1 && N == 1024 && D == 128) {
-        return rmsnorm_forward_launch<16, 1024, 128, 1>(x, gamma, eps);
-    }
-
-    TORCH_CHECK(false, "Unsupported shape for rmsnorm_forward_cuda. Supported now: H=1, N in {128,256,512,1024}, D in {64,128}");
+    return rmsnorm_forward_launch<16>(x, gamma, eps);
 }
-
 
 std::vector<torch::Tensor> rmsnorm_backward_cuda(
     torch::Tensor dy,
@@ -532,41 +510,5 @@ std::vector<torch::Tensor> rmsnorm_backward_cuda(
     torch::Tensor gamma,
     double eps
 ) {
-    const int H = x.size(1);
-    const int N = x.size(2);
-    const int D = x.size(3);
-
-    if (H == 1 && N == 128 && D == 64) {
-        return rmsnorm_backward_launch<16, 128, 64, 1>(dy, x, gamma, eps);
-    }
-
-    if (H == 1 && N == 256 && D == 64) {
-        return rmsnorm_backward_launch<16, 256, 64, 1>(dy, x, gamma, eps);
-    }
-
-    if (H == 1 && N == 512 && D == 64) {
-        return rmsnorm_backward_launch<16, 512, 64, 1>(dy, x, gamma, eps);
-    }
-
-    if (H == 1 && N == 1024 && D == 64) {
-        return rmsnorm_backward_launch<16, 1024, 64, 1>(dy, x, gamma, eps);
-    }
-
-    if (H == 1 && N == 128 && D == 128) {
-        return rmsnorm_backward_launch<16, 128, 128, 1>(dy, x, gamma, eps);
-    }
-
-    if (H == 1 && N == 256 && D == 128) {
-        return rmsnorm_backward_launch<16, 256, 128, 1>(dy, x, gamma, eps);
-    }
-
-    if (H == 1 && N == 512 && D == 128) {
-        return rmsnorm_backward_launch<16, 512, 128, 1>(dy, x, gamma, eps);
-    }
-
-    if (H == 1 && N == 1024 && D == 128) {
-        return rmsnorm_backward_launch<16, 1024, 128, 1>(dy, x, gamma, eps);
-    }
-
-    TORCH_CHECK(false, "Unsupported shape for rmsnorm_backward_cuda. Supported now: H=1, N in {128,256,512,1024}, D in {64,128}");
+    return rmsnorm_backward_launch<16>(dy, x, gamma, eps);
 }

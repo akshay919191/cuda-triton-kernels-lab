@@ -1,67 +1,87 @@
 #pragma once
 
 #include "../common/common_helper.cuh"
+
 #include <torch/extension.h>
 #include <cuda_runtime.h>
-#include <stdio.h>
 #include <cuda_fp16.h>
-#include <stdint.h>
 #include <cuda.h>
-#include <cuda_fp16.h>
 #include <stdint.h>
 #include <math.h>
 #include <float.h>
-#include <cassert>
 
-// Private helpers for rmsnorm kernel only.
 
-template<int Br, int rows, int cols>
+template<int Br>
 __device__ __forceinline__ void cpasynccopyRMS(
     const __half* __restrict__ input,
           __half* __restrict__ out,
-          int stride,
-          int itr
+    int stride,
+    int itr,
+    int rows,
+    int cols
 )
 {
     int tid = threadIdx.x;
 
     constexpr int numperitr = 8; // 16 bytes = 8 halfs
-    constexpr int totalitr  = (Br * cols) / numperitr;
 
-    for (int i = tid; i < totalitr; i += blockDim.x)
+    if ((cols & 7) == 0)
     {
-        int logical_offset = i * numperitr;
+        int vec_cols = cols / numperitr;
+        int total_vec = Br * vec_cols;
 
-        int logical_row = logical_offset / cols;
-        int logical_col = logical_offset % cols;
+        for (int i = tid; i < total_vec; i += blockDim.x)
+        {
+            int logical_row = i / vec_cols;
+            int vec_id      = i % vec_cols;
 
-        int actual_row = logical_row + itr * Br;  // FIXED: Br, not 4
-        int actual_col = logical_col;
+            int logical_col = vec_id * numperitr;
 
-        uint32_t smem_addr = static_cast<uint32_t>(
-            __cvta_generic_to_shared(out + logical_row * stride + logical_col)
-        );
+            int actual_row = logical_row + itr * Br;
+            int actual_col = logical_col;
 
-        bool isvalid = (actual_row < rows) && (actual_col + 7 < cols);
+            uint32_t smem_addr = static_cast<uint32_t>(
+                __cvta_generic_to_shared(out + logical_row * stride + logical_col)
+            );
 
-        const __half* global_src =
-            isvalid ? input + (size_t)actual_row * cols + actual_col : input;
+            bool isvalid = actual_row < rows;
 
-        int predicate = isvalid ? 1 : 0;
+            const __half* global_src =
+                isvalid ? input + (size_t)actual_row * cols + actual_col : input;
 
-        asm volatile(
-            "{\n"
-            "  .reg .pred p;\n"
-            "  .reg .u32 z;\n"
-            "  mov.u32 z, 0;\n"
-            "  setp.ne.b32 p, %2, 0;\n"
-            "  @p  cp.async.cg.shared.global [%0], [%1], 16;\n"
-            "  @!p st.shared.v4.b32 [%0], {z, z, z, z};\n"
-            "}\n"
-            :
-            : "r"(smem_addr), "l"(global_src), "r"(predicate)
-            : "memory"
-        );
+            int predicate = isvalid ? 1 : 0;
+
+            asm volatile(
+                "{\n"
+                "  .reg .pred p;\n"
+                "  .reg .u32 z;\n"
+                "  mov.u32 z, 0;\n"
+                "  setp.ne.b32 p, %2, 0;\n"
+                "  @p  cp.async.cg.shared.global [%0], [%1], 16;\n"
+                "  @!p st.shared.v4.b32 [%0], {z, z, z, z};\n"
+                "}\n"
+                :
+                : "r"(smem_addr), "l"(global_src), "r"(predicate)
+                : "memory"
+            );
+        }
+    }
+    else
+    {
+        for (int i = tid; i < Br * cols; i += blockDim.x)
+        {
+            int logical_row = i / cols;
+            int logical_col = i % cols;
+
+            int actual_row = logical_row + itr * Br;
+
+            if (actual_row < rows) {
+                out[logical_row * stride + logical_col] =
+                    input[(size_t)actual_row * cols + logical_col];
+            } else {
+                out[logical_row * stride + logical_col] = __float2half(0.0f);
+            }
+        }
     }
 }
 
@@ -84,26 +104,22 @@ void multiWarpReductionSUM_RMS(
     {
         const __half* rowPtr = input + row * rowStride;
 
-        float localsum = 0.0f;
+        float localSum = 0.0f;
 
-        const half2* rowPtr2 = reinterpret_cast<const half2*>(rowPtr);
-        int cols2 = cols >> 1;
-
-        for (int i = lane; i < cols2; i += WARP_SIZE)
+        for (int c = lane; c < cols; c += WARP_SIZE)
         {
-            half2 h = rowPtr2[i];
-            float2 f = __half22float2(h);
-
-            localsum += f.x * f.x;
-            localsum += f.y * f.y;
+            float x = __half2float(rowPtr[c]);
+            localSum += x * x;
         }
 
-        localsum = reducesum(localsum);
+        localSum = reducesum(localSum);
 
-        if (lane == 0)
-            out[row] = localsum;
+        if (lane == 0) {
+            out[row] = localSum;
+        }
     }
 }
+
 
 __device__ __forceinline__
 void multiWarpReductionSUM_plain_RMS(
@@ -123,52 +139,54 @@ void multiWarpReductionSUM_plain_RMS(
     {
         const __half* rowPtr = input + row * rowStride;
 
-        float localsum = 0.0f;
+        float localSum = 0.0f;
 
-        const half2* rowPtr2 = reinterpret_cast<const half2*>(rowPtr);
-        int cols2 = cols >> 1;
-
-        for (int i = lane; i < cols2; i += WARP_SIZE)
+        for (int c = lane; c < cols; c += WARP_SIZE)
         {
-            half2 h = rowPtr2[i];
-            float2 f = __half22float2(h);
-
-            localsum += f.x;
-            localsum += f.y;
+            localSum += __half2float(rowPtr[c]);
         }
 
-        localsum = reducesum(localsum);
+        localSum = reducesum(localSum);
 
-        if (lane == 0)
-            out[row] = localsum;
+        if (lane == 0) {
+            out[row] = localSum;
+        }
     }
 }
 
 
-template<int M , int N , int K> /// this handles broadcastings too  (M * N) * (K * N) where K == 1  or (M * N) * (K * N) N == 1
-__device__ __forceinline__ void elementwisemultiply(
+__device__ __forceinline__
+void elementwisemultiply_runtime(
     const __half* __restrict__ inputA,
     const __half* __restrict__ inputB,
-          __half* __restrict__ output 
+          __half* __restrict__ output,
+    int M,
+    int N,
+    int K
 )
 {
-    int tid  = threadIdx.x;
-    
-    for(int i = tid ; i < M * N ; i += blockDim.x)
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < M * N; i += blockDim.x)
     {
         int r = i / N;
         int c = i % N;
 
+        float a;
+        float b;
+
         if (K == 1) {
-            output[r * N + c] = inputA[r * N + c] * inputB[c];
-        } else if(N == 1) {
-            output[r * N * c] = inputB[r * N + c] * inputA[c];
+            a = __half2float(inputA[r * N + c]);
+            b = __half2float(inputB[c]);
+        } else if (N == 1) {
+            a = __half2float(inputA[c]);
+            b = __half2float(inputB[r * N + c]);
         } else {
-            /// means we are safe dims are equal but safely we will have a fallback using assert 
-            assert((M == K) && "M does not equal K (K != 1, no broadcasting)");
-            output[r * N + c] = inputA[r * N + c] * inputB[r * N + c];
+            a = __half2float(inputA[r * N + c]);
+            b = __half2float(inputB[r * N + c]);
         }
+
+        output[r * N + c] = __float2half(a * b);
     }
 }
-
 
