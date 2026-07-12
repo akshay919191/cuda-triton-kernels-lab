@@ -11,6 +11,8 @@
 #include <vector>
 
 #define PADDING 8
+#define FLOAT4(x)  (*reinterpret_cast<float4*>(&(x)))
+#define CFLOAT4(x) (*reinterpret_cast<const float4*>(&(x)))
 
 template<int Br>
 __global__ void fusedrmsfwd_kernel(
@@ -30,7 +32,6 @@ __global__ void fusedrmsfwd_kernel(
     const int batchid = blockIdx.x;
     const int headid  = blockIdx.y;
     const int tileid  = blockIdx.z;
-        /// as it is used in attentions in transformers so we need to use batchid and all
     const long long base = (long long)batchid * numhead * headdim * seqlen + 
                                 (long long)headid * headdim * seqlen;
 
@@ -113,8 +114,10 @@ __global__ void fusedrmsfwd_kernel(
     __syncthreads();
 
     for(int i = tid ; i < Br * headdim ; i += blockDim.x) {
-        float a = Asmem[i]; float b = res[i];
-        Asmem[i] = __float2half(a+b);
+        int r = i / headdim;
+        int c = i % headdim;
+        int idx = r * rowStride + c;
+        Asmem[idx] = __float2half(__half2float(Asmem[idx]) + __half2float(res[idx]));
     }
     __syncthreads();
         /// loaded the whole Br * headim 
@@ -414,4 +417,211 @@ __global__ void fusedrmsbwd_kernel(
         out[globalRow * headdim + c]    = __float2half(dz);
         resout[globalRow * headdim + c] = __float2half(dz);
     }
+}
+
+static inline size_t align32_bytes(size_t x) {
+    return (x + 31) & ~size_t(31);
+}
+
+template<int Br>
+static inline size_t fused_rms_fwd_smem_bytes(int D) {
+    size_t bytes = 0;
+
+    const int rowStride = D + PADDING;
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * rowStride * sizeof(__half);  // Asmem: x, later z/output
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * rowStride * sizeof(__half);  // res: residual
+
+    bytes = align32_bytes(bytes);
+    bytes += (D + PADDING) * sizeof(__half);   // gamma
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * sizeof(float);               // result
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * sizeof(float);               // denoSmem
+
+    bytes += 128;
+    return bytes;
+}
+
+template<int Br>
+static inline size_t fused_rms_bwd_smem_bytes(int D) {
+    size_t bytes = 0;
+
+    const int rowStride = D + PADDING;
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * rowStride * sizeof(__half);  // dl_in: z = x + residual
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * rowStride * sizeof(__half);  // dl_final: dy
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * rowStride * sizeof(__half);  // res: residual temp
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * rowStride * sizeof(__half);  // dl_O: delta
+
+    bytes = align32_bytes(bytes);
+    bytes += (D + PADDING) * sizeof(__half);   // gamma
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * sizeof(float);               // result/rms
+
+    bytes = align32_bytes(bytes);
+    bytes += Br * sizeof(float);               // summat
+
+    bytes += 128;
+    return bytes;
+}
+
+template<int Br>
+std::vector<torch::Tensor> fused_residual_rmsnorm_forward_launch(
+    torch::Tensor x,
+    torch::Tensor residual,
+    torch::Tensor gamma,
+    double eps
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(residual);
+    CHECK_INPUT(gamma);
+
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
+    TORCH_CHECK(residual.scalar_type() == torch::kFloat16, "residual must be float16");
+    TORCH_CHECK(gamma.scalar_type() == torch::kFloat16, "gamma must be float16");
+
+    TORCH_CHECK(x.dim() == 4, "x must be [B, H, N, D]");
+    TORCH_CHECK(residual.sizes() == x.sizes(), "residual shape must match x");
+    TORCH_CHECK(gamma.dim() == 1, "gamma must be [D]");
+
+    const int B = x.size(0);
+    const int H = x.size(1);
+    const int N = x.size(2);
+    const int D = x.size(3);
+
+    TORCH_CHECK(gamma.size(0) == D, "gamma.size(0) must match D");
+    TORCH_CHECK(D % 8 == 0, "D must be divisible by 8 because kernel uses FLOAT4 vectorized stores");
+
+    auto y = torch::empty_like(x);
+
+    dim3 grid(B, H, (N + Br - 1) / Br);
+    dim3 block(256);
+
+    size_t smem = fused_rms_fwd_smem_bytes<Br>(D);
+
+    if (smem > 48 * 1024) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            fusedrmsfwd_kernel<Br>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem)
+        ));
+    }
+
+    fusedrmsfwd_kernel<Br><<<grid, block, smem>>>(
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(residual.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
+        static_cast<float>(eps),
+        reinterpret_cast<const __half*>(gamma.data_ptr<at::Half>()),
+        N,
+        D,
+        H
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+
+    return {y};
+}
+
+
+template<int Br>
+std::vector<torch::Tensor> fused_residual_rmsnorm_backward_launch(
+    torch::Tensor dy,
+    torch::Tensor x,
+    torch::Tensor residual,
+    torch::Tensor gamma,
+    double eps
+) {
+    CHECK_INPUT(dy);
+    CHECK_INPUT(x);
+    CHECK_INPUT(residual);
+    CHECK_INPUT(gamma);
+
+    TORCH_CHECK(dy.scalar_type() == torch::kFloat16, "dy must be float16");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
+    TORCH_CHECK(residual.scalar_type() == torch::kFloat16, "residual must be float16");
+    TORCH_CHECK(gamma.scalar_type() == torch::kFloat16, "gamma must be float16");
+
+    TORCH_CHECK(x.dim() == 4, "x must be [B, H, N, D]");
+    TORCH_CHECK(dy.sizes() == x.sizes(), "dy shape must match x");
+    TORCH_CHECK(residual.sizes() == x.sizes(), "residual shape must match x");
+    TORCH_CHECK(gamma.dim() == 1, "gamma must be [D]");
+
+    const int B = x.size(0);
+    const int H = x.size(1);
+    const int N = x.size(2);
+    const int D = x.size(3);
+
+    TORCH_CHECK(gamma.size(0) == D, "gamma.size(0) must match D");
+    TORCH_CHECK(D % 8 == 0, "D must be divisible by 8 because kernel uses vectorized ops");
+
+    auto dx = torch::empty_like(x);
+    auto dresidual = torch::empty_like(x);
+    auto dgamma = torch::zeros({D}, x.options().dtype(torch::kFloat32));
+
+    dim3 grid(B, H, (N + Br - 1) / Br);
+    dim3 block(256);
+
+    size_t smem = fused_rms_bwd_smem_bytes<Br>(D);
+
+    if (smem > 48 * 1024) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            fusedrmsbwd_kernel<Br>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem)
+        ));
+    }
+
+    fusedrmsbwd_kernel<Br><<<grid, block, smem>>>(
+        reinterpret_cast<const __half*>(dy.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(residual.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(gamma.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(dx.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(dresidual.data_ptr<at::Half>()),
+        dgamma.data_ptr<float>(),
+        static_cast<float>(eps),
+        N,
+        D,
+        H
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+
+    return {dx, dresidual, dgamma};
+}
+
+
+std::vector<torch::Tensor> fused_residual_rmsnorm_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor residual,
+    torch::Tensor gamma,
+    double eps
+) {
+    return fused_residual_rmsnorm_forward_launch<16>(x, residual, gamma, eps);
+}
+
+
+std::vector<torch::Tensor> fused_residual_rmsnorm_backward_cuda(
+    torch::Tensor dy,
+    torch::Tensor x,
+    torch::Tensor residual,
+    torch::Tensor gamma,
+    double eps
+) {
+    return fused_residual_rmsnorm_backward_launch<16>(dy, x, residual, gamma, eps);
 }
