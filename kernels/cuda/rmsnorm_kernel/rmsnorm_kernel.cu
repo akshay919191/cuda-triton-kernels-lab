@@ -81,7 +81,7 @@ __global__ void rmsfwd_kernel(
         gamma[i] = gammaGlobal[i];
     }
     __syncthreads();
-    cpasynccopyRMS<Br>(
+    cpasynccopy<Br>(
         INptr,
         Asmem,
         headdim + PADDING,
@@ -213,7 +213,7 @@ __global__ void rmsbwd_kernel(
         gamma[i] = gammaGlobal[i];
     }
 
-    cpasynccopyRMS<Br>(
+    cpasynccopy<Br>(
         INptr,
         dl_in,
         headdim + PADDING,
@@ -223,7 +223,7 @@ __global__ void rmsbwd_kernel(
     );
     asm volatile("cp.async.commit_group;\n");
 
-    cpasynccopyRMS<Br>(
+    cpasynccopy<Br>(
         Fptr,
         dl_final,
         headdim + PADDING,
