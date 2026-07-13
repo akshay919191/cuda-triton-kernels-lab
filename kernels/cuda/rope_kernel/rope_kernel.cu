@@ -270,7 +270,6 @@ __global__ void rope_forward_kernel(
 
             float result = x;
 
-            // Dimensions outside rotary_dim remain unchanged.
             if (d < rotary_dim) {
                 int freq_idx;
                 float rotated;
@@ -314,4 +313,361 @@ __global__ void rope_forward_kernel(
                 static_cast<scalar_t>(result);
         }
     }
+}
+
+/// backward
+
+
+std::vector<torch::Tensor> build_rope_cache_cuda(
+    const torch::Tensor& reference,
+    int64_t cache_len,
+    int64_t rotary_dim
+) {
+    TORCH_CHECK(reference.is_cuda(),
+                "reference must be a CUDA tensor");
+
+    TORCH_CHECK(cache_len > 0,
+                "cache_len must be positive");
+
+    TORCH_CHECK(rotary_dim > 0,
+                "rotary_dim must be positive");
+
+    TORCH_CHECK((rotary_dim & 1) == 0,
+                "rotary_dim must be even");
+
+    c10::cuda::CUDAGuard device_guard(
+        reference.device()
+    );
+
+    int halfrot = static_cast<int>(rotary_dim / 2);
+
+    auto options = torch::TensorOptions()
+        .device(reference.device())
+        .dtype(torch::kFloat32);
+
+    torch::Tensor inv_freq =
+        torch::empty({halfrot}, options);
+
+    torch::Tensor cos_cache =
+        torch::empty({cache_len, halfrot}, options);
+
+    torch::Tensor sin_cache =
+        torch::empty({cache_len, halfrot}, options);
+
+    cudaStream_t stream =
+        at::cuda::getCurrentCUDAStream();
+
+    constexpr int threads = 256;
+
+    int inv_blocks =
+        (halfrot + threads - 1) / threads;
+
+    build_inv_freq_kernel<10000>
+        <<<inv_blocks, threads, 0, stream>>>(
+            inv_freq.data_ptr<float>(),
+            static_cast<int>(rotary_dim)
+        );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    int64_t total =
+        cache_len * static_cast<int64_t>(halfrot);
+
+    int cache_blocks =
+        static_cast<int>(
+            (total + threads - 1) / threads
+        );
+
+    build_rope_cache_kernel
+        <<<cache_blocks, threads, 0, stream>>>(
+            inv_freq.data_ptr<float>(),
+            cos_cache.data_ptr<float>(),
+            sin_cache.data_ptr<float>(),
+            static_cast<int>(cache_len),
+            halfrot
+        );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // Keep inv_freq too, especially if you later expand the cache.
+    return {
+        cos_cache,
+        sin_cache,
+        inv_freq
+    };
+}
+
+template<
+    typename scalar_t,
+    typename index_t,
+    int Br
+>
+void launch_rope_forward(
+    const torch::Tensor& x,
+    const index_t* position_ptr,
+    const torch::Tensor& sin_cache,
+    const torch::Tensor& cos_cache,
+    torch::Tensor& output,
+    int rotary_dim,
+    int64_t position_offset
+) {
+    int batch = static_cast<int>(x.size(0));
+    int heads = static_cast<int>(x.size(1));
+    int seq_len = static_cast<int>(x.size(2));
+    int head_dim = static_cast<int>(x.size(3));
+
+    int cache_len =
+        static_cast<int>(sin_cache.size(0));
+
+    int halfrot = rotary_dim / 2;
+    int tiles = (seq_len + Br - 1) / Br;
+
+    constexpr int threads = 128;
+
+    dim3 grid(batch, heads, tiles);
+
+    size_t smem_bytes =
+        48 + // alignment slack
+        static_cast<size_t>(Br) *
+            (head_dim + FPAD) * sizeof(float) +
+        static_cast<size_t>(Br) *
+            halfrot * sizeof(float) * 2;
+
+    cudaStream_t stream =
+        at::cuda::getCurrentCUDAStream();
+
+    // Necessary when dynamic shared memory exceeds the default limit.
+    if (smem_bytes > 48 * 1024) {
+        C10_CUDA_CHECK(
+            cudaFuncSetAttribute(
+                rope_forward_kernel<
+                    scalar_t,
+                    index_t,
+                    Br
+                >,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(smem_bytes)
+            )
+        );
+    }
+
+    rope_forward_kernel<
+        scalar_t,
+        index_t,
+        Br
+    ><<<grid, threads, smem_bytes, stream>>>(
+        x.data_ptr<scalar_t>(),
+        position_ptr,
+        sin_cache.data_ptr<float>(),
+        cos_cache.data_ptr<float>(),
+        output.data_ptr<scalar_t>(),
+        seq_len,
+        cache_len,
+        rotary_dim,
+        head_dim,
+        heads,
+        position_offset
+    );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor rope_forward_cuda(
+    const torch::Tensor& x,
+    const std::optional<torch::Tensor>& position_ids,
+    const torch::Tensor& cos_cache,
+    const torch::Tensor& sin_cache,
+    int64_t rotary_dim,
+    int64_t position_offset,
+    int64_t Br
+) {
+    TORCH_CHECK(x.is_cuda(),
+                "x must be a CUDA tensor");
+
+    TORCH_CHECK(x.dim() == 4,
+                "x must have shape [B,H,S,D]");
+
+    TORCH_CHECK(x.is_contiguous(),
+                "x must be contiguous");
+
+    TORCH_CHECK(
+        x.scalar_type() == torch::kFloat32 ||
+        x.scalar_type() == torch::kFloat16 ||
+        x.scalar_type() == torch::kBFloat16,
+        "x must be float32, float16 or bfloat16"
+    );
+
+    TORCH_CHECK(cos_cache.is_cuda() &&
+                sin_cache.is_cuda(),
+                "RoPE caches must be CUDA tensors");
+
+    TORCH_CHECK(
+        cos_cache.device() == x.device() &&
+        sin_cache.device() == x.device(),
+        "x and caches must be on the same device"
+    );
+
+    TORCH_CHECK(
+        cos_cache.scalar_type() == torch::kFloat32 &&
+        sin_cache.scalar_type() == torch::kFloat32,
+        "RoPE caches must be float32"
+    );
+
+    TORCH_CHECK(
+        cos_cache.is_contiguous() &&
+        sin_cache.is_contiguous(),
+        "RoPE caches must be contiguous"
+    );
+
+    TORCH_CHECK(
+        cos_cache.sizes() == sin_cache.sizes(),
+        "sin and cos cache shapes must match"
+    );
+
+    TORCH_CHECK(cos_cache.dim() == 2,
+                "cache must have shape [cache_len, halfrot]");
+
+    int64_t batch = x.size(0);
+    int64_t seq_len = x.size(2);
+    int64_t head_dim = x.size(3);
+
+    TORCH_CHECK(rotary_dim > 0,
+                "rotary_dim must be positive");
+
+    TORCH_CHECK((rotary_dim & 1) == 0,
+                "rotary_dim must be even");
+
+    TORCH_CHECK(rotary_dim <= head_dim,
+                "rotary_dim cannot exceed head_dim");
+
+    TORCH_CHECK(
+        cos_cache.size(1) == rotary_dim / 2,
+        "cache second dimension must equal rotary_dim / 2"
+    );
+
+    if (!position_ids.has_value()) {
+        TORCH_CHECK(position_offset >= 0,
+                    "position_offset cannot be negative");
+
+        TORCH_CHECK(
+            position_offset + seq_len <=
+                cos_cache.size(0),
+            "implicit positions exceed RoPE cache"
+        );
+    } else {
+        const torch::Tensor& pos =
+            position_ids.value();
+
+        TORCH_CHECK(pos.is_cuda(),
+                    "position_ids must be CUDA");
+
+        TORCH_CHECK(pos.device() == x.device(),
+                    "position_ids must be on x's device");
+
+        TORCH_CHECK(pos.is_contiguous(),
+                    "position_ids must be contiguous");
+
+        TORCH_CHECK(
+            pos.dim() == 2 &&
+            pos.size(0) == batch &&
+            pos.size(1) == seq_len,
+            "position_ids must have shape [B,S]"
+        );
+
+        TORCH_CHECK(
+            pos.scalar_type() == torch::kInt32 ||
+            pos.scalar_type() == torch::kInt64,
+            "position_ids must be int32 or int64"
+        );
+    }
+
+    torch::Tensor output = torch::empty_like(x);
+
+    if (x.numel() == 0)
+        return output;
+
+    c10::cuda::CUDAGuard device_guard(x.device());
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        x.scalar_type(),
+        "rope_forward_cuda",
+        [&] {
+            auto launch_for_br = [&](auto* pos_ptr) {
+                using index_t = std::remove_pointer_t<
+                    decltype(pos_ptr)
+                >;
+
+                switch (Br) {
+                    case 16:
+                        launch_rope_forward<
+                            scalar_t, index_t, 16
+                        >(
+                            x,
+                            pos_ptr,
+                            sin_cache,
+                            cos_cache,
+                            output,
+                            static_cast<int>(rotary_dim),
+                            position_offset
+                        );
+                        break;
+
+                    case 32:
+                        launch_rope_forward<
+                            scalar_t, index_t, 32
+                        >(
+                            x,
+                            pos_ptr,
+                            sin_cache,
+                            cos_cache,
+                            output,
+                            static_cast<int>(rotary_dim),
+                            position_offset
+                        );
+                        break;
+
+                    case 64:
+                        launch_rope_forward<
+                            scalar_t, index_t, 64
+                        >(
+                            x,
+                            pos_ptr,
+                            sin_cache,
+                            cos_cache,
+                            output,
+                            static_cast<int>(rotary_dim),
+                            position_offset
+                        );
+                        break;
+
+                    default:
+                        TORCH_CHECK(
+                            false,
+                            "Supported Br values are 16, 32 and 64"
+                        );
+                }
+            };
+
+            if (!position_ids.has_value()) {
+                launch_for_br(
+                    static_cast<const int32_t*>(nullptr)
+                );
+            } else if (
+                position_ids->scalar_type() ==
+                torch::kInt32
+            ) {
+                launch_for_br(
+                    position_ids->data_ptr<int32_t>()
+                );
+            } else {
+                launch_for_br(
+                    position_ids->data_ptr<int64_t>()
+                );
+            }
+        }
+    );
+
+    return output;
 }
