@@ -11,8 +11,6 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-#include <pybind11/stl.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -22,8 +20,6 @@
 #include <vector>
 
 #define FPAD 1
-
-namespace py = pybind11;
 
 /*
 Tensor layouts:
@@ -102,6 +98,7 @@ __global__ void build_rope_cache_kernel(
     sin_cache[idx] = sn;
     cos_cache[idx] = cs;
 }
+
 
 template<typename index_t>
 __device__ __forceinline__ int64_t get_rope_position(
@@ -299,7 +296,9 @@ __global__ void rope_apply_kernel(
         static_cast<int>(blockIdx.z);
 
     const int halfrot = rotary_dim / 2;
-    const int row_stride = head_dim + FPAD;
+
+    const int row_stride =
+        (head_dim + FPAD + 3) & ~3;
 
     const int64_t tensor_base =
         (
@@ -598,9 +597,12 @@ std::vector<torch::Tensor> build_rope_cache_cuda(
         threads;
 
     int device = 0;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
+    C10_CUDA_CHECK(
+        cudaGetDevice(&device)
+    );
 
     cudaDeviceProp properties{};
+
     C10_CUDA_CHECK(
         cudaGetDeviceProperties(
             &properties,
@@ -681,10 +683,13 @@ void launch_rope_apply(
         static_cast<unsigned int>(tiles)
     );
 
+    const int row_stride =
+        (head_dim + FPAD + 3) & ~3;
+
     const size_t smem_bytes =
         48 +
         static_cast<size_t>(Br) *
-            (head_dim + FPAD) *
+            row_stride *
             sizeof(float) +
         static_cast<size_t>(Br) *
             halfrot *
@@ -692,9 +697,13 @@ void launch_rope_apply(
             2;
 
     int device = 0;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
+
+    C10_CUDA_CHECK(
+        cudaGetDevice(&device)
+    );
 
     cudaDeviceProp properties{};
+
     C10_CUDA_CHECK(
         cudaGetDeviceProperties(
             &properties,
@@ -1034,9 +1043,7 @@ void validate_rope_inputs(
         positions.scalar_type() == torch::kInt64,
         "position_ids must be int32 or int64"
     );
-
 }
-
 
 
 template<bool Backward>
@@ -1182,45 +1189,5 @@ torch::Tensor rope_backward_cuda(
         rotary_dim,
         position_offset,
         Br
-    );
-}
-
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(
-        "build_cache",
-        &build_rope_cache_cuda,
-        py::arg("reference"),
-        py::arg("cache_len"),
-        py::arg("rotary_dim"),
-        py::arg("base") = 10000.0,
-        "Build FP32 RoPE cosine, sine and inverse-frequency caches"
-    );
-
-    m.def(
-        "forward",
-        &rope_forward_cuda,
-        py::arg("input"),
-        py::arg("position_ids"),
-        py::arg("cos_cache"),
-        py::arg("sin_cache"),
-        py::arg("rotary_dim"),
-        py::arg("position_offset") = 0,
-        py::arg("Br") = 32,
-        "RoPE forward CUDA"
-    );
-
-    m.def(
-        "backward",
-        &rope_backward_cuda,
-        py::arg("grad_out"),
-        py::arg("position_ids"),
-        py::arg("cos_cache"),
-        py::arg("sin_cache"),
-        py::arg("rotary_dim"),
-        py::arg("position_offset") = 0,
-        py::arg("Br") = 32,
-        "RoPE backward CUDA"
     );
 }
