@@ -18,155 +18,188 @@
 // inv_freq     : [rotary_dim / 2]   FP32
 // output       : [B, H, S, D]       same dtype as x
 
-template<int base , int Br>
+template<int Base>
 __global__ void build_rope_cache_nopos(
-    float* cos_cache,        // maxseqlen , rotatary_dim / 2
-    float* sin_cache,       
-    int max_seq_len,
-    int rotatary_dim
-){
-    int tid = threadIdx.x;
-    const int tileid = blockIdx.x;
+    float* __restrict__ cos_cache,  // [cache_len, halfrot]
+    float* __restrict__ sin_cache,
+    int cache_len,
+    int rotary_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int halfrot = rotary_dim / 2;
+    int total = cache_len * halfrot;
 
-    int halfrot   = rotatary_dim / 2;
+    if (idx >= total)
+        return;
 
-    extern __shared__ char smem[];
-    char* ptr = smem;
+    int position = idx / halfrot;
+    int d = idx % halfrot;
 
-    /// theta = maxseqlen outer prod W(omega)
+    float inv_freq = powf(
+        static_cast<float>(Base),
+        -2.0f * static_cast<float>(d) /
+        static_cast<float>(rotary_dim)
+    );
 
-    float* inv_freq  = reinterpret_cast<float*>(ptr);
-    ptr += (halfrot) * sizeof(float);    // [rotatary_dim / 2 + 1]
+    float theta = static_cast<float>(position) * inv_freq;
 
-    float* seqlenitr = reinterpret_cast<float*>(ptr);
-    ptr += max_seq_len * sizeof(float);
+    float sn, cs;
+    sincosf(theta, &sn, &cs);
 
-    float* buff = reinterpret_cast<float*>(ptr);
-    ptr += max_seq_len * sizeof(float);
-
-
-    for(int i = tid ; i < max_seq_len ; i += blockDim.x) seqlenitr[i] = i; __syncthreads()
-
-    for(int i = tid ; i < halfrot ; i += blockDim.x) inv_freq[i] = rsqrtf(powf(base , 2 * i / rotatary_dim)); __syncthreads();
-
-    /// now we have L and W , theta is L outer W 
-    
-    /// we do Br , so multiple blocks can be launched and be used parallely
-    for(int i = tid ; i < Br * halfrot ; i += blockDim.x){
-        int r = i / halfrot;
-        int c = i % halfrot;
-
-        int global_row = tileid * Br + r;
-        if(global_row >= max_seq_len) continue;
-
-        sin_cache[global_row * halfrot + c] = sinf(seqlenitr[global_row] * inv_freq[c]);
-        cos_cache[global_row * halfrot + c] = cosf(seqlenitr[global_row] * inv_freq[c]);
-    }
-    /// shape is [seqlen , halfrot] , now either you can repeat looping , or make [seqlen , rotatory_dim]
+    sin_cache[idx] = sn;
+    cos_cache[idx] = cs;
 }
 
-template<typename scaler_t , int Br>
+template<typename scalar_t, int Br>
 __global__ void ropefwd_kernel(
-    const float* __restrict__ matrix, ///[batch , numhead , seqlen , headdim]
-    const float* __restrict__ sin_cached,
+    const scalar_t* __restrict__ matrix,      // [B,H,S,D]
+    const int32_t* __restrict__ position_ids, // [B,S]
+    const float* __restrict__ sin_cached,     // [cache_len,halfrot]
     const float* __restrict__ cos_cached,
-          float* __restrict__ output,
-    int max_seq_len, int rotatary_dim
-    int headdim , int numhead
-)
-{
-    int tid = threadIdx.x; int warpid = tid >> 5; int lane = tid & 31;
+    scalar_t* __restrict__ output,
+    int seq_len,
+    int cache_len,
+    int rotary_dim,
+    int head_dim,
+    int num_heads
+) {
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane = tid & 31;
+    int num_warps = blockDim.x >> 5;
 
-    /*
-    Args:
-        input is a matrix  , eg [1,2,3,4,5,6]
-    return:
-        [-4,-5,-6,1,2,3] * sin + [1,2,3,4,5,6] * cos
-    */
+    int batch_id = blockIdx.x;
+    int head_id = blockIdx.y;
+    int tile_id = blockIdx.z;
 
-    const int batchid = blockIdx.x;
-    const int headid  = blockIdx.y;
-    const int tileid  = blockIdx.z;
+    int halfrot = rotary_dim / 2;
+    int row_stride = head_dim + fPAD;
 
-    const long long base = (long long)batchid * numhead * max_seq_len * headdim +
-                           (long long)headid  * max_seq_len * headdim;
+    int64_t tensor_base =
+        (static_cast<int64_t>(batch_id) * num_heads + head_id) *
+        seq_len * head_dim;
 
-    const int rowstride = headdim + fPAD;
-    const int halfdim   = headdim >> 1;
-    const int halfrot   = rotatary_dim >> 1;
-
-    extern __shared__ char smem[];
-    char* ptr = smem;
+    extern __shared__ char smem_raw[];
+    char* ptr = smem_raw;
 
     ptr = reinterpret_cast<char*>(
         (reinterpret_cast<uintptr_t>(ptr) + 15) & ~15ULL
     );
 
-    float* smemA = reinterpret_cast<float*>(ptr);
-    ptr += Br * rowstride * sizeof(float);
+    float* smem_x = reinterpret_cast<float*>(ptr);
+    ptr += Br * row_stride * sizeof(float);
 
-    float* normal = reinterpret_cast<float*>(ptr);
-    ptr += headdim * sizeof(float);
+    // Only halfrot values are needed per row.
+    float* sin_smem = reinterpret_cast<float*>(ptr);
+    ptr += Br * halfrot * sizeof(float);
 
-    float* rotate = reinterpret_cast<float*>(ptr);
-    ptr += headdim * sizeof(float);
+    float* cos_smem = reinterpret_cast<float*>(ptr);
 
-    float* sin_cache = reinterpret_cast<float*>(ptr);
-    ptr += Br * headdim * sizeof(float);
+    /*
+     * Load cached sin/cos for this batch's actual position_ids.
+     * Assumes halfrot is divisible by 4.
+     */
+    for (
+        int i = tid;
+        i < Br * (halfrot / 4);
+        i += blockDim.x
+    ) {
+        int row = i / (halfrot / 4);
+        int c = (i % (halfrot / 4)) * 4;
 
-    float* cos_cache = reinterpret_cast<float*>(ptr);
-    ptr += Br * headdim * sizeof(float);
+        int global_row = tile_id * Br + row;
 
-    scalar_t* INptr = matrix + base; 
-    float*   outptr = output + base;
+        if (global_row < seq_len) {
+            int position =
+                position_ids[batch_id * seq_len + global_row];
 
-    for (int i = tid; i < Br * (headdim / 4); i += blockDim.x) {
-        int r = i / (headdim / 4);
-        int c = (i % (headdim / 4)) * 4;
+            // Prefer validating this in the launcher.
+            if (position >= 0 && position < cache_len) {
+                int src = position * halfrot + c;
+                int dst = row * halfrot + c;
 
-        int src = (tileid * Br + r) * halfrot + (c % halfrot);
-        int dst = r * headdim + c;
+                *reinterpret_cast<float4*>(sin_smem + dst) =
+                    *reinterpret_cast<const float4*>(
+                        sin_cached + src
+                    );
 
-        *reinterpret_cast<float4*>(sin_cache + dst) =
-            *reinterpret_cast<const float4*>(sin_cached + src);
-
-        *reinterpret_cast<float4*>(cos_cache + dst) =
-            *reinterpret_cast<const float4*>(cos_cached + src);
+                *reinterpret_cast<float4*>(cos_smem + dst) =
+                    *reinterpret_cast<const float4*>(
+                        cos_cached + src
+                    );
+            }
+        }
     }
 
     __syncthreads();
 
     copy_to_float_smem<scalar_t, Br>(
-        INptr,
-        smemA,
-        rowstride,
-        tileid,
-        max_seq_len,
-        headdim
+        matrix + tensor_base,
+        smem_x,
+        row_stride,
+        tile_id,
+        seq_len,
+        head_dim
     );
 
-    asm volatile("cp.async.commit_group;\n");
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    if constexpr (std::is_same_v<scalar_t, float>) {
+        asm volatile("cp.async.commit_group;\n");
+        asm volatile(
+            "cp.async.wait_group 0;\n"
+            ::: "memory"
+        );
+    }
 
     __syncthreads();
 
-    for(int row = warpid ; row < Br ; row += blockDim.x >> 5){
-        for(int i = lane ; i < headdim ; i += 32)
-        {
-            normal[i] = smemA[row * rowstride + i];
-            int rotateIDX = (i < halfdim) ? halfdim + i : i & halfdim;
-            rotate[i] = (i < headdim) ? -smemA[row * rowstride + rotateIDX] : smemA[row * rowstride + rotateIDX];
+    for (
+        int row = warp_id;
+        row < Br;
+        row += num_warps
+    ) {
+        int global_row = tile_id * Br + row;
+
+        if (global_row >= seq_len)
+            continue;
+
+        for (
+            int d = lane;
+            d < head_dim;
+            d += 32
+        ) {
+            float x = smem_x[row * row_stride + d];
+            float y = x;
+
+            if (d < rotary_dim) {
+                int freq_idx;
+                float rotated;
+
+                if (d < halfrot) {
+                    freq_idx = d;
+                    rotated = -smem_x[
+                        row * row_stride + d + halfrot
+                    ];
+                } else {
+                    freq_idx = d - halfrot;
+                    rotated = smem_x[
+                        row * row_stride + d - halfrot
+                    ];
+                }
+
+                float sn =
+                    sin_smem[row * halfrot + freq_idx];
+
+                float cs =
+                    cos_smem[row * halfrot + freq_idx];
+
+                y = x * cs + rotated * sn;
+            }
+
+            output[
+                tensor_base +
+                static_cast<int64_t>(global_row) * head_dim +
+                d
+            ] = static_cast<scalar_t>(y);
         }
-        __syncthreads();
-
-
-        for(int i = lane ; i < headdim ; i += 32){
-            int globalrow = tileid * Br + row;
-            if(globalrow >= max_seq_len) continue;
-
-            outptr[global_row * headdim + i] = normal[i] * cos_cache[row * headdim + i] + rotate[i] * sin_cache[row * headdim + i];
-        }
-        __syncthreads();
     }
-    
 }
