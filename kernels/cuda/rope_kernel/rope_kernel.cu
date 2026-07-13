@@ -137,15 +137,6 @@ __device__ __forceinline__ void load_rope_cache_tile(
 ) {
     const int tid = threadIdx.x;
 
-    /*
-    Vector path.
-
-    Safe when halfrot is divisible by four because:
-
-        cache row stride = halfrot floats
-        c                = multiple of four
-        torch allocation = sufficiently aligned
-    */
     if ((halfrot & 3) == 0) {
         const int vecs_per_row = halfrot / 4;
         const int total_vecs = Br * vecs_per_row;
