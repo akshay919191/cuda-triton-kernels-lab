@@ -2,14 +2,18 @@ import os
 from pathlib import Path
 
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import (
+    BuildExtension,
+    CUDAExtension,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 
-# RTX 3050 Laptop GPU is compute capability 8.6.
-# An externally provided value will override this.
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
+os.environ.setdefault(
+    "TORCH_CUDA_ARCH_LIST",
+    "8.6",
+)
 
 
 setup(
@@ -24,11 +28,6 @@ setup(
                 "rope_kernel.cu",
             ],
 
-            include_dirs=[
-                ".",
-                "../common",
-            ],
-
             extra_compile_args={
                 "cxx": [
                     "-O3",
@@ -39,7 +38,6 @@ setup(
                     "-O3",
                     "-std=c++17",
                     "-lineinfo",
-
                     "--expt-relaxed-constexpr",
                 ],
             },
