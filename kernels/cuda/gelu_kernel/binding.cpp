@@ -1,11 +1,7 @@
 #include <torch/extension.h>
-
-#include <torch/extension.h>
 #include <vector>
 
-std::vector<torch::Tensor> gelu_forward_cuda(
-    torch::Tensor x
-);
+std::vector<torch::Tensor> gelu_forward_cuda(torch::Tensor x);
 
 std::vector<torch::Tensor> gelu_backward_cuda(
     torch::Tensor dy,
