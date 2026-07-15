@@ -50,10 +50,7 @@ __global__ void gelufwd_kernel(
         // Load from global memory
         float val = __half2float(INptr[idx]);
 
-        // Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
         float gelu_val = 0.5f * val * (1.0f + erff(val * RSQRT_2));
-
-        // Store to global memory
         outptr[idx] = __float2half(gelu_val);
     }
 }
