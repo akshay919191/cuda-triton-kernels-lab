@@ -5,7 +5,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
 
 setup(
-    name="gelu_cuda",
+    name="silu_cuda",
     ext_modules=[
         CUDAExtension(
             name="silu_cuda",
