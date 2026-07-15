@@ -1,89 +1,53 @@
 #include "../common/common_helper.cuh"
-#include "private_helper.cuh"
 
-#include <cuda.h>
-#include <cuda_fp16.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
-#include <stdint.h>
+#include <cuda_fp16.h>
 #include <math.h>
-#include <float.h>
-#include <iostream>
-#include <cmath>
 #include <vector>
 
-#define PADDING 8
-#define FLOAT4(x)  (*reinterpret_cast<float4*>(&(x)))
-#define CFLOAT4(x) (*reinterpret_cast<const float4*>(&(x)))
+#define RSQRT_2 0.70710678118654752440f
 
 template<int Br>
 __global__ void fusedgelufwd_kernel(
     const __half* __restrict__ input,
     const float*  __restrict__ bias,
-          __half* __restrict__ output ,
-    const int seqlen , const int headdim , const int numhead
+          __half* __restrict__ output,
+    const int seqlen,
+    const int headdim,
+    const int numhead
 )
 {
-    int tid    = threadIdx.x;
+    int tid = threadIdx.x;
 
     const int batchid = blockIdx.x;
     const int headid  = blockIdx.y;
     const int tileid  = blockIdx.z;
 
     const long long base = (long long)batchid * numhead * headdim * seqlen + 
-                                (long long)headid * headdim * seqlen;
+                           (long long)headid * headdim * seqlen;
 
     const __half* INptr  = input + base;
           __half* outptr = output + base;
-    const float*  biasp  = bias;              
-    const int rowStride = headdim + PADDING;
 
-    extern __shared__ char smem[];
-
-    char* ptr = smem;
-
-    ptr = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
-    );
-
-    __half* smemA = reinterpret_cast<__half*>(ptr);
-    ptr += Br * (headdim + PADDING) * sizeof(__half);
-
-    float* biass = reinterpret_cast<float*>(ptr);
-    ptr += headdim * sizeof(float);
-
-    for(int i = tid ; i < headdim ; i += blockDim.x) biass[i] = biasp[i];  
-
-    __syncthreads();
-
-    cpasynccopy<Br>(INptr , smemA , headdim + PADDING , tileid , seqlen , headdim);
-    asm volatile("cp.async.commit_group;\n");
-    asm volatile("cp.async.wait_group 0;\n");
-
-    __syncthreads();
-
-    for(int i = tid ; i < Br * headdim ; i += blockDim.x){
+    // Process elements directly from global memory
+    for (int i = tid; i < Br * headdim; i += blockDim.x)
+    {
         int r = i / headdim;
         int c = i % headdim;
 
-        int smemidx = r * rowStride + c;   // fixed: was `rowstride`
-        smemA[smemidx] = __float2half(__half2float(smemA[smemidx]) + biass[c]);
-    }
-
-    __syncthreads();
-
-    performGelu<Br>(smemA , headdim + PADDING , headdim);
-    __syncthreads();
-
-    for (int i = tid; i < Br * headdim; i += blockDim.x)
-    {
-        int row = i / headdim;
-        int col = i % headdim;
-
-        int globalRow = tileid * Br + row;
+        int globalRow = tileid * Br + r;
         if (globalRow >= seqlen) continue;
 
-        outptr[globalRow * headdim + col] =
-            smemA[row * rowStride + col];
+        long long idx = (long long)globalRow * headdim + c;
+
+        float val = __half2float(INptr[idx]) + bias[c];
+
+        float gelu_val = 0.5f * val * (1.0f + erff(val * RSQRT_2));
+
+        // 3. Store output
+        outptr[idx] = __float2half(gelu_val);
     }
 }
 
@@ -105,149 +69,70 @@ __global__ void fusedgelubwd_kernel(
     const int headid  = blockIdx.y;
     const int tileid  = blockIdx.z;
 
-    const int rowStride = headdim + PADDING;
-
-    const long long base    = (long long)batchid * numhead * seqlen * headdim +
-                        (long long)headid  * seqlen * headdim;
+    const long long base = (long long)batchid * numhead * seqlen * headdim +
+                           (long long)headid  * seqlen * headdim;
 
     const __half* INptr  = input  + base;
     const __half* prevv  = dl_dy  + base;
-    const float*  biasp  = bias;              
-    
           __half* outptr = output + base;
-
-    extern __shared__ char smem[];
-    
-    char* ptr = smem;
-
-    ptr = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
-    );
-
-    __half* smemA = reinterpret_cast<__half*>(ptr);
-    ptr += Br * (headdim + PADDING) * sizeof(__half);
-
-    ptr = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(ptr) + 31) & ~31ULL
-    );
-
-    __half* upstream = reinterpret_cast<__half*>(ptr);
-    ptr += Br * (headdim + PADDING) * sizeof(__half);
-
-    float* biass = reinterpret_cast<float*>(ptr);
-    ptr += headdim * sizeof(float);
-
-    for(int i = tid ; i < headdim ; i += blockDim.x) biass[i] = biasp[i];  
-
-    __syncthreads();
-
-    cpasynccopy<Br>(prevv , upstream , headdim + PADDING , tileid , seqlen , headdim);
-    asm volatile("cp.async.commit_group;\n");
-
-    cpasynccopy<Br>(INptr , smemA , headdim + PADDING , tileid , seqlen , headdim);
-    asm volatile("cp.async.commit_group;\n");
-
-    asm volatile("cp.async.wait_group 0;\n");
-
-    __syncthreads();
-
-    for(int i = tid ; i < Br * headdim ; i += blockDim.x){
-        int r = i / headdim;
-        int c = i % headdim;
-
-        int smemidx = r * rowStride + c;   // fixed: was `rowstride`
-        smemA[smemidx] = __float2half(__half2float(smemA[smemidx]) + biass[c]);
-    }
-
-    __syncthreads();
-
-    performGelubck<Br>(smemA , upstream , headdim + PADDING , headdim);
-    __syncthreads();
 
     for (int i = tid; i < Br * headdim; i += blockDim.x)
     {
-        int row = i / headdim;
-        int col = i % headdim;
+        int r = i / headdim;
+        int c = i % headdim;
 
-        int globalRow = tileid * Br + row;
+        int globalRow = tileid * Br + r;
         if (globalRow >= seqlen) continue;
 
-        float dx_val = __half2float(smemA[row * rowStride + col]);
+        long long idx = (long long)globalRow * headdim + c;
 
-        atomicAdd(&dl_bias[col], dx_val);
+        float val = __half2float(INptr[idx]) + bias[c];
 
-        outptr[globalRow * headdim + col] = __float2half(dx_val);
+        // 2. Load upstream gradient
+        float grad = __half2float(prevv[idx]);
+
+        float cdf = 0.5f * (1.0f + erff(val * RSQRT_2));
+        float pdf = 0.39894228040143267793f * expf(-0.5f * val * val); 
+        float d_gelu = grad * (cdf + val * pdf);
+
+        atomicAdd(&dl_bias[c], d_gelu);
+
+        outptr[idx] = __float2half(d_gelu);
     }
 }
 
-static inline size_t align32_bytes(size_t x) {
-    return (x + 31) & ~size_t(31);
-}
 
 template<int Br>
-static inline size_t gelu_fwd_smem_bytes(int D) {
-    size_t bytes = 0;
-
-    bytes = align32_bytes(bytes);
-    bytes += Br * (D + PADDING) * sizeof(__half);
-
-    bytes = align32_bytes(bytes);
-    bytes += D * sizeof(float); 
-
-    bytes += 128;
-    return bytes;
-}
-
-template<int Br>
-static inline size_t gelu_bwd_smem_bytes(int D) {
-    size_t bytes = 0;
-
-    bytes = align32_bytes(bytes);
-    bytes += Br * (D + PADDING) * sizeof(__half);  // smemA
-
-    bytes = align32_bytes(bytes);
-    bytes += Br * (D + PADDING) * sizeof(__half);  // upstream
-
-    bytes = align32_bytes(bytes);
-    bytes += D * sizeof(float);  // bias staging
-
-    bytes += 128;
-    return bytes;
-}
-
-template<int Br>
-std::vector<torch::Tensor> fused_bias_gelu_forward_launch(torch::Tensor x, torch::Tensor b){
+std::vector<torch::Tensor> fused_bias_gelu_forward_launch(
+    torch::Tensor x,
+    torch::Tensor bias
+) {
     CHECK_INPUT(x);
-    CHECK_INPUT(b);   // added: bias was never validated
+    CHECK_INPUT(bias);
 
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
+    TORCH_CHECK(bias.scalar_type() == torch::kFloat32, "bias must be float32");
+
     TORCH_CHECK(x.dim() == 4, "x must be [B, H, N, D]");
-    TORCH_CHECK(b.scalar_type() == torch::kFloat32, "bias must be float32");
-    TORCH_CHECK(b.dim() == 1 && b.size(0) == x.size(3), "bias must be [D]");
+    TORCH_CHECK(bias.dim() == 1, "bias must be [D]");
 
     const int B = x.size(0);
     const int H = x.size(1);
     const int N = x.size(2);
     const int D = x.size(3);
 
+    TORCH_CHECK(bias.size(0) == D, "bias.size(0) must match D");
+
     auto y = torch::empty_like(x);
 
     dim3 grid(B, H, (N + Br - 1) / Br);
     dim3 block(256);
 
-    size_t smem = gelu_fwd_smem_bytes<Br>(D);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if (smem > 48 * 1024) {
-        CUDA_CHECK(cudaFuncSetAttribute(
-            fusedgelufwd_kernel<Br>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem)
-        ));
-    }
-
-    fusedgelufwd_kernel<Br><<<grid, block, smem>>>(
+    fusedgelufwd_kernel<Br><<<grid, block, 0, stream>>>(
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
-        b.data_ptr<float>(),                      
+        bias.data_ptr<float>(),
         reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
         N,
         D,
@@ -259,27 +144,31 @@ std::vector<torch::Tensor> fused_bias_gelu_forward_launch(torch::Tensor x, torch
     return {y};
 }
 
+
 template<int Br>
 std::vector<torch::Tensor> fused_bias_gelu_backward_launch(
     torch::Tensor dy,
     torch::Tensor x,
-    torch::Tensor b
+    torch::Tensor bias
 ) {
     CHECK_INPUT(dy);
     CHECK_INPUT(x);
-    CHECK_INPUT(b);
+    CHECK_INPUT(bias);
 
     TORCH_CHECK(dy.scalar_type() == torch::kFloat16, "dy must be float16");
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
+    TORCH_CHECK(bias.scalar_type() == torch::kFloat32, "bias must be float32");
+
     TORCH_CHECK(x.dim() == 4, "x must be [B, H, N, D]");
     TORCH_CHECK(dy.sizes() == x.sizes(), "dy shape must match x");
-    TORCH_CHECK(b.scalar_type() == torch::kFloat32, "bias must be float32");
-    TORCH_CHECK(b.dim() == 1 && b.size(0) == x.size(3), "bias must be [D]");
+    TORCH_CHECK(bias.dim() == 1, "bias must be [D]");
 
     const int B = x.size(0);
     const int H = x.size(1);
     const int N = x.size(2);
     const int D = x.size(3);
+
+    TORCH_CHECK(bias.size(0) == D, "bias.size(0) must match D");
 
     auto dx = torch::empty_like(x);
 
@@ -292,20 +181,12 @@ std::vector<torch::Tensor> fused_bias_gelu_backward_launch(
     dim3 grid(B, H, (N + Br - 1) / Br);
     dim3 block(256);
 
-    size_t smem = gelu_bwd_smem_bytes<Br>(D);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if (smem > 48 * 1024) {
-        CUDA_CHECK(cudaFuncSetAttribute(
-            fusedgelubwd_kernel<Br>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem)
-        ));
-    }
-
-    fusedgelubwd_kernel<Br><<<grid, block, smem>>>(
+    fusedgelubwd_kernel<Br><<<grid, block, 0, stream>>>(
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(dy.data_ptr<at::Half>()),
-        b.data_ptr<float>(),
+        bias.data_ptr<float>(),
         reinterpret_cast<__half*>(dx.data_ptr<at::Half>()),
         dbias.data_ptr<float>(),
         N,
@@ -318,18 +199,20 @@ std::vector<torch::Tensor> fused_bias_gelu_backward_launch(
     return {dx, dbias};
 }
 
+
 std::vector<torch::Tensor> fused_bias_gelu_forward_cuda(
     torch::Tensor x,
-    torch::Tensor b
+    torch::Tensor bias
 ) {
-    return fused_bias_gelu_forward_launch<16>(x, b);
+    return fused_bias_gelu_forward_launch<16>(x, bias);
 }
 
 
 std::vector<torch::Tensor> fused_bias_gelu_backward_cuda(
     torch::Tensor dy,
     torch::Tensor x,
-    torch::Tensor b
+    torch::Tensor bias
 ) {
-    return fused_bias_gelu_backward_launch<16>(dy, x, b);
+    return fused_bias_gelu_backward_launch<16>(dy, x, bias);
 }
+
