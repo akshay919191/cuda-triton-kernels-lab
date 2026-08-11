@@ -33,7 +33,6 @@ def matmul(
 
     first_pid_m = group_id * GROUP     # where the first row starts
     
-    # FIX 1: Dynamically clamp the group size to prevent out-of-bounds pid_m
     group_size_m = min(num_pid_m - first_pid_m, GROUP)
     
     pid_m = first_pid_m + (pid_in_group % group_size_m)
