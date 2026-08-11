@@ -9,6 +9,7 @@ KBLOCK = 32
 NUM_WARPS = 4
 NUM_STAGES = 3
 
+
 @triton.jit
 def matmul(
     xptr,
@@ -32,15 +33,24 @@ def matmul(
     pid_in_group = pid % group_size    # pid number in group
 
     first_pid_m = group_id * GROUP     # where the first row starts
-    
+
     group_size_m = min(num_pid_m - first_pid_m, GROUP)
-    
+
     pid_m = first_pid_m + (pid_in_group % group_size_m)
     pid_n = pid_in_group // group_size_m
 
     offs_am = pid_m * MBLOCK + tl.arange(0, MBLOCK)
     offs_bn = pid_n * NBLOCK + tl.arange(0, NBLOCK)
     offs_k = tl.arange(0, KBLOCK)
+
+    offs_am = tl.max_contiguous(offs_am, MBLOCK)
+    offs_am = tl.multiple_of(offs_am, MBLOCK)
+
+    offs_bn = tl.max_contiguous(offs_bn, NBLOCK)
+    offs_bn = tl.multiple_of(offs_bn, NBLOCK)
+
+    offs_k = tl.max_contiguous(offs_k, KBLOCK)
+    offs_k = tl.multiple_of(offs_k, KBLOCK)
 
     a_ptrs = (
         xptr
@@ -59,6 +69,7 @@ def matmul(
     acc = tl.zeros((MBLOCK, NBLOCK), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, KBLOCK)):
+
         k_mask = offs_k < (K - k * KBLOCK)
 
         a = tl.load(
@@ -93,6 +104,7 @@ def matmul(
 
 
 def triton_matmul(x, y, GROUP=2):
+
     x = x.contiguous()
     y = y.contiguous()
 
