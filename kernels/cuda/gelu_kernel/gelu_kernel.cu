@@ -12,6 +12,7 @@
 #include <float.h>
 #include <iostream>
 #include <cmath>
+
 #define PADDING 8
 #define FLOAT4(x)  (*reinterpret_cast<float4*>(&(x)))
 #define CFLOAT4(x) (*reinterpret_cast<const float4*>(&(x)))
@@ -34,24 +35,42 @@ __global__ void gelufwd_kernel(
     const long long base = (long long)batchid * numhead * headdim * seqlen + 
                                 (long long)headid * headdim * seqlen;
 
-    const __half* INptr  = input + base;
-    __half* outptr       = output + base;
+    const __half2* INptr2  = reinterpret_cast<const __half2*>(input + base);
+    __half2* outptr2       = reinterpret_cast<__half2*>(output + base);
 
-    for (int i = tid; i < Br * headdim; i += blockDim.x)
+    const int headdim2 = headdim >> 1;
+    const int total_elements2 = Br * headdim2;
+
+    for (int i = tid; i < total_elements2; i += blockDim.x)
     {
-        int row = i / headdim;
-        int col = i % headdim;
+        int row = i / headdim2;
+        int col = i % headdim2;
 
         int globalRow = tileid * Br + row;
         if (globalRow >= seqlen) continue;
 
-        long long idx = (long long)globalRow * headdim + col;
+        long long idx = (long long)globalRow * headdim2 + col;
         
-        // Load from global memory
-        float val = __half2float(INptr[idx]);
+        __half2 val_h2 = INptr2[idx];
+        float2 val_f2 = __half22float2(val_h2);
 
-        float gelu_val = 0.5f * val * (1.0f + erff(val * RSQRT_2));
-        outptr[idx] = __float2half(gelu_val);
+        float out_x = 0.5f * val_f2.x * (1.0f + erff(val_f2.x * RSQRT_2));
+        float out_y = 0.5f * val_f2.y * (1.0f + erff(val_f2.y * RSQRT_2));
+
+        outptr2[idx] = __floats2half2_rn(out_x, out_y);
+    }
+
+    if (headdim & 1) {
+        int col_odd = headdim - 1;
+        for (int row = tid; row < Br; row += blockDim.x) {
+            int globalRow = tileid * Br + row;
+            if (globalRow >= seqlen) continue;
+            
+            long long idx = (long long)globalRow * headdim + col_odd;
+            float val = __half2float((input + base)[idx]);
+            float gelu_val = 0.5f * val * (1.0f + erff(val * RSQRT_2));
+            (output + base)[idx] = __float2half(gelu_val);
+        }
     }
 }
 
@@ -72,30 +91,57 @@ __global__ void gelubwd_kernel(
     const long long base = (long long)batchid * numhead * seqlen * headdim +
                         (long long)headid  * seqlen * headdim;
 
-    const __half* INptr  = input  + base;
-    const __half* prevv  = dl_dy  + base;
-    __half* outptr       = output + base;
+    const __half2* INptr2  = reinterpret_cast<const __half2*>(input + base);
+    const __half2* prevv2 = reinterpret_cast<const __half2*>(dl_dy + base);
+    __half2* outptr2      = reinterpret_cast<__half2*>(output + base);
 
-    for (int i = tid; i < Br * headdim; i += blockDim.x)
+    const int headdim2 = headdim >> 1;
+    const int total_elements2 = Br * headdim2;
+
+    for (int i = tid; i < total_elements2; i += blockDim.x)
     {
-        int row = i / headdim;
-        int col = i % headdim;
+        int row = i / headdim2;
+        int col = i % headdim2;
 
         int globalRow = tileid * Br + row;
         if (globalRow >= seqlen) continue;
 
-        long long idx = (long long)globalRow * headdim + col;
+        long long idx = (long long)globalRow * headdim2 + col;
 
-        float val  = __half2float(INptr[idx]);
-        float grad = __half2float(prevv[idx]);
-
-        float cdf = 0.5f * (1.0f + erff(val * RSQRT_2));
-        float pdf = 0.39894228040143267793f * expf(-0.5f * val * val); // 1/sqrt(2*pi) * exp(-x^2/2)
+        __half2 val_h2  = INptr2[idx];
+        __half2 grad_h2 = prevv2[idx];
         
-        float grad_val = grad * (cdf + val * pdf);
+        float2 val_f2  = __half22float2(val_h2);
+        float2 grad_f2 = __half22float2(grad_h2);
 
-        // Store to global memory
-        outptr[idx] = __float2half(grad_val);
+        float cdf_x = 0.5f * (1.0f + erff(val_f2.x * RSQRT_2));
+        float pdf_x = 0.39894228040143267793f * __expf(-0.5f * val_f2.x * val_f2.x);
+        float out_x = grad_f2.x * __fmaf_rn(val_f2.x, pdf_x, cdf_x);
+
+        float cdf_y = 0.5f * (1.0f + erff(val_f2.y * RSQRT_2));
+        float pdf_y = 0.39894228040143267793f * __expf(-0.5f * val_f2.y * val_f2.y);
+        float out_y = grad_f2.y * __fmaf_rn(val_f2.y, pdf_y, cdf_y);
+
+        // Vectorized store
+        outptr2[idx] = __floats2half2_rn(out_x, out_y);
+    }
+
+    if (headdim & 1) {
+        int col_odd = headdim - 1;
+        for (int row = tid; row < Br; row += blockDim.x) {
+            int globalRow = tileid * Br + row;
+            if (globalRow >= seqlen) continue;
+            
+            long long idx = (long long)globalRow * headdim + col_odd;
+            float val  = __half2float((input + base)[idx]);
+            float grad = __half2float((dl_dy + base)[idx]);
+
+            float cdf = 0.5f * (1.0f + erff(val * RSQRT_2));
+            float pdf = 0.39894228040143267793f * __expf(-0.5f * val * val);
+            float grad_val = grad * __fmaf_rn(val, pdf, cdf);
+
+            (output + base)[idx] = __float2half(grad_val);
+        }
     }
 }
 
